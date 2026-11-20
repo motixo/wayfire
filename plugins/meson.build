@@ -68,7 +68,14 @@ plugins = [
   'scale',
   'single_plugins',
   'ipc-rules',
+  'panel-decor',
+  'window-sizes',
+  'tile-focus',
 ]
+
+if conf_data.get('BUILD_WITH_IMAGEIO')
+  plugins += 'dock-snapshot'
+endif
 
 devenv = environment()
 foreach plugin : plugins

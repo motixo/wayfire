@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<wayfire>
+    <plugin name="rounded-windows">
+        <_short>Rounded Windows</_short>
+        <_long>Clips window content to the corner radius from panel-decor and draws an active-window border.</_long>
+        <category>Effects</category>
+        <option name="active_border_width" type="int">
+            <_short>Active border width</_short>
+            <_long>Border width in pixels. Zero disables the border without disabling rounded corners.</_long>
+            <default>0</default>
+            <min>0</min>
+            <max>12</max>
+        </option>
+        <option name="active_border_color" type="string">
+            <_short>Active border color</_short>
+            <_long>Use auto to follow the active palette accent, or a #RRGGBB color.</_long>
+            <default>auto</default>
+        </option>
+    </plugin>
+</wayfire>

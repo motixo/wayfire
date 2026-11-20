@@ -1,0 +1,196 @@
+#pragma once
+#include <wayfire/render-manager.hpp>
+#include <wayfire/scene-render.hpp>
+#include "deco-button.hpp"
+#include <string>
+#include <memory>
+#include <map>
+
+namespace wf
+{
+namespace decor
+{
+inline constexpr int decoration_shadow_blur = 3;
+
+/**
+ * A  class which manages the outlook of decorations.
+ * It is responsible for determining the background colors, sizes, etc.
+ */
+class decoration_theme_t
+{
+  public:
+    /** Create a new theme with the default parameters */
+    decoration_theme_t();
+    ~decoration_theme_t();
+
+    /** @return The available height for displaying the title */
+    int get_title_height() const;
+    /** @return The button's square layout size in logical pixels */
+    int get_button_size() const;
+    /** @return The available border for resizing */
+    int get_border_size() const;
+    /** Set the flags for buttons */
+    void set_buttons(button_type_t flags);
+    button_type_t button_flags;
+
+    /**
+     * Fill the given rectangle with the background color(s).
+     *
+     * @param data The render data (pass, target, damage)
+     * @param rectangle The rectangle to redraw.
+     * @param active Whether to use active or inactive colors
+     */
+    void render_background(const wf::scene::render_instruction_t& data,
+        wf::geometry_t rectangle, bool active) const;
+
+    /**
+     * Get corner radius for rounded titlebar
+     */
+    int get_corner_radius() const;
+
+    /**
+     * Render the given text on a cairo_surface_t with the given size.
+     * The caller is responsible for freeing the memory afterwards.
+     * @param button_area_width Width occupied by buttons at the right edge
+     */
+    cairo_surface_t *render_text(const std::string& text, int width, int height,
+        int button_area_width = 0, double scale = 1.0) const;
+
+    struct button_state_t
+    {
+        /** Button width */
+        double width;
+        /** Button height */
+        double height;
+        /** Button outline size */
+        double border;
+        /** Progress of button hover, in range [-1, 1].
+         * Negative numbers are usually used for pressed state. */
+        double hover_progress;
+        /** Whether the window is active/focused */
+        bool activated = true;
+    };
+
+    /**
+     * Get the icon for the given button.
+     * The caller is responsible for freeing the memory afterwards.
+     *
+     * @param button The button type.
+     * @param state The button state.
+     */
+    cairo_surface_t *get_button_surface(button_type_t button,
+        const button_state_t& state) const;
+
+    // Force reload of theme (called when theme changes)
+    void reload_theme() const;
+
+  private:
+    wf::option_wrapper_t<std::string> font{"panel-decor/font"};
+    wf::option_wrapper_t<wf::color_t> font_color{"panel-decor/font_color"};
+    wf::option_wrapper_t<int> title_height{"panel-decor/title_height"};
+    wf::option_wrapper_t<int> button_size{"panel-decor/button_size"};
+    wf::option_wrapper_t<int> title_font_size{"panel-decor/title_font_size"};
+    wf::option_wrapper_t<int> border_size{"panel-decor/border_size"};
+    wf::option_wrapper_t<wf::color_t> active_color{"panel-decor/active_color"};
+    wf::option_wrapper_t<wf::color_t> inactive_color{"panel-decor/inactive_color"};
+    /** auto: use GTK theme assets when available; gtk: always draw;
+     * traffic: palette-coloured circles with glyphs on hover */
+    wf::option_wrapper_t<std::string> button_style{"panel-decor/button_style"};
+    wf::option_wrapper_t<std::string> button_close_color{"panel-decor/button_close_color"};
+    wf::option_wrapper_t<std::string> button_minimize_color{"panel-decor/button_minimize_color"};
+    wf::option_wrapper_t<std::string> button_maximize_color{"panel-decor/button_maximize_color"};
+
+    wf::option_wrapper_t<int> corner_radius{"panel-decor/corner_radius"};
+
+    // GTK theme parsing (mutable for lazy initialization)
+    mutable bool theme_loaded;
+    mutable wf::color_t theme_titlebar_bg_active;
+    mutable wf::color_t theme_titlebar_bg_inactive;
+    mutable wf::color_t theme_titlebar_fg_active;
+    mutable wf::color_t theme_titlebar_fg_inactive;
+    mutable wf::color_t theme_button_bg;
+    mutable wf::color_t theme_button_hover_bg;
+    mutable wf::color_t theme_button_active_bg;
+    mutable std::string theme_font_family;
+    mutable int theme_font_size;
+    mutable std::string icon_theme_name;
+    mutable std::string gtk_theme_name;
+    mutable bool panel_palette_loaded = false;
+    mutable wf::color_t palette_accent;
+    mutable wf::color_t palette_accent_text;
+    mutable wf::color_t palette_error;
+    mutable wf::color_t palette_warning;
+    mutable wf::color_t palette_success;
+    mutable wf::color_t palette_border;
+    mutable wf::color_t palette_muted;
+
+    void load_gtk_theme() const;
+    bool load_panel_palette() const;
+    std::string get_gtk_theme_name() const;
+    std::string get_icon_theme_name() const;
+    std::string get_gtk_font_name() const;
+    std::string find_theme_css_file(const std::string& theme_name) const;
+    std::string find_icon_file(const std::string& icon_name, int size) const;
+
+    /**
+     * Locate a metacity-1 titlebutton asset for the given button and state,
+     * e.g. <theme>/metacity-1/titlebuttons/titlebutton-close-hover.svg
+     * @return Path to the asset, or "" if the theme ships none.
+     */
+    std::string find_titlebutton_file(button_type_t button,
+        const button_state_t& state) const;
+
+    /**
+     * Render a titlebutton asset at @size, cached by path and size so the
+     * SVG is not re-parsed on every frame of the hover animation.
+     * @return Borrowed surface owned by the cache, or nullptr on failure.
+     */
+    cairo_surface_t *get_titlebutton_asset(const std::string& path, int size) const;
+
+    /** Rendered titlebutton assets, keyed by "<path>@<size>" */
+    mutable std::map<std::string, cairo_surface_t*> titlebutton_cache;
+    void clear_titlebutton_cache() const;
+    void parse_theme_css(const std::string& css_file) const;
+
+    /** A window button's colours, as declared in the theme's stylesheet */
+    struct titlebutton_colors_t
+    {
+        wf::color_t bg;
+        wf::color_t pressed_bg;
+        wf::color_t backdrop_bg;
+        wf::color_t fg;
+        wf::color_t hover_fg;
+        wf::color_t backdrop_hover_fg;
+    };
+
+    /** Filled only for themes that colour each button differently */
+    mutable std::map<button_type_t, titlebutton_colors_t> titlebutton_colors;
+    void parse_titlebutton_colors(std::string css) const;
+    wf::color_t parse_css_color(const std::string& color_str) const;
+
+    // Background surface cache — avoids recreating Cairo surfaces every frame
+    mutable struct bg_cache_t
+    {
+        wf::geometry_t geometry{};
+        bool active = false;
+        bool valid = false;
+
+        std::unique_ptr<wf::owned_texture_t> titlebar_tex;
+        wf::geometry_t titlebar_rect{};
+
+        std::unique_ptr<wf::owned_texture_t> left_tex;
+        wf::geometry_t left_rect{};
+
+        std::unique_ptr<wf::owned_texture_t> right_tex;
+        wf::geometry_t right_rect{};
+
+        std::unique_ptr<wf::owned_texture_t> bottom_tex;
+        wf::geometry_t bottom_rect{};
+
+        std::unique_ptr<wf::owned_texture_t> outline_tex;
+        wf::geometry_t outline_rect{};
+    } bg_cache;
+    void invalidate_cache() const;
+};
+}
+}

@@ -45,6 +45,7 @@ These are the dependencies needed for building Wayfire.
 - [libpng](http://libpng.org/pub/png/libpng.html)
 - [libxkbcommon](https://xkbcommon.org)
 - [libxml2](http://xmlsoft.org/)
+- json-c for the desktop plugins, plus optional librsvg for SVG button icons
 - [Pixman](https://pixman.org)
 - [pkg-config](https://freedesktop.org/wiki/Software/pkg-config/)
 - [Wayland](https://wayland.freedesktop.org)
@@ -113,6 +114,29 @@ wayfire-plugin install https://github.com/soreau/pixdecor
 ```
 
 See [Managing External Plugins](docs/wayfire-plugin.md) for more information.
+
+### Desktop plugins in this fork
+
+The normal Meson build includes the following modules. Add the names you want
+to `[core]` → `plugins` in `wayfire.ini`:
+
+- `panel-decor` supplies themed server-side title bars in place of
+  `decoration`. It reads the Desktop Settings palette and uses the bundled
+  Tabler icons when the Quickshell equivalents are absent.
+- `rounded-windows` applies the `[panel-decor]` corner radius and draws the
+  active border. It requires the GLES renderer.
+- `window-sizes` remembers resized floating windows and centers them at
+  their saved size on the next launch. It uses the same
+  `$XDG_STATE_HOME/wayfire-window-sizes/sizes.json` state file as the standalone
+  plugin, with a fallback under `~/.local/state`.
+- `tile-focus` follows the pointer in tiled workspaces and uses a fade for
+  tiled window openings. It follows `[simple-tile]` → `tile_by_default`.
+- `dock-snapshot` captures minimized windows and provides live previews over
+  Wayfire IPC. It builds when image I/O is available and uses the GLES renderer.
+
+For a configuration using the standalone hot reload names, replace
+`rounded-windows-r16` and `window-sizes-r4` with the unversioned names above.
+The `[panel-decor]` and `[rounded-windows]` settings use the same option names.
 
 ###### Arch Linux
 

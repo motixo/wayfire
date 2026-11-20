@@ -1,0 +1,1780 @@
+#include "deco-theme.hpp"
+#include <wayfire/core.hpp>
+#include <wayfire/opengl.hpp>
+#include <fstream>
+#include <sstream>
+#include <regex>
+#include <algorithm>
+#include <cmath>
+#include <vector>
+#include <sys/stat.h>
+#include <json-c/json.h>
+
+#ifdef HAVE_LIBRSVG
+#include <librsvg/rsvg.h>
+#endif
+
+namespace wf
+{
+namespace decor
+{
+static std::string panel_config_home()
+{
+    if (const char *xdg = getenv("XDG_CONFIG_HOME"); xdg && *xdg)
+    {
+        return xdg;
+    }
+
+    if (const char *home = getenv("HOME"); home && *home)
+    {
+        return std::string(home) + "/.config";
+    }
+
+    return "";
+}
+
+bool decoration_theme_t::load_panel_palette() const
+{
+    const std::string config = panel_config_home();
+    if (config.empty())
+    {
+        return false;
+    }
+
+    const std::string path = config + "/desktop-settings/appearance/colors/current.json";
+    json_object *root = json_object_from_file(path.c_str());
+    if (!root)
+    {
+        return false;
+    }
+
+    json_object *colors = nullptr;
+    auto color = [&] (const char *key, wf::color_t& target) -> bool
+    {
+        json_object *value = nullptr;
+        if (!json_object_object_get_ex(colors, key, &value) ||
+            !json_object_is_type(value, json_type_string))
+        {
+            return false;
+        }
+
+        const char *hex = json_object_get_string(value);
+        if (!hex || !std::regex_match(hex, std::regex("#[0-9a-fA-F]{6}")))
+        {
+            return false;
+        }
+
+        target = parse_css_color(hex);
+        return true;
+    };
+
+    wf::color_t surface, surface_alt, text, muted, accent, accent_text, error, border;
+    bool valid = json_object_object_get_ex(root, "colors", &colors) &&
+        json_object_is_type(colors, json_type_object);
+    valid = valid && color("surface", surface) &&
+        color("surface_alt", surface_alt) &&
+        color("text", text) &&
+        color("muted", muted) &&
+        color("accent", accent) &&
+        color("accent_text", accent_text) &&
+        color("error", error) &&
+        color("border", border);
+    if (!valid)
+    {
+        json_object_put(root);
+        return false;
+    }
+
+    json_object *ansi = nullptr;
+    if (json_object_object_get_ex(root, "ansi", &ansi) &&
+        json_object_is_type(ansi, json_type_array))
+    {
+        auto ansi_color = [&] (int index, wf::color_t& target)
+        {
+            json_object *value = json_object_array_get_idx(ansi, index);
+            if (value && json_object_is_type(value, json_type_string))
+            {
+                const char *hex = json_object_get_string(value);
+                if (hex && std::regex_match(hex, std::regex("#[0-9a-fA-F]{6}")))
+                {
+                    target = parse_css_color(hex);
+                }
+            }
+        };
+        ansi_color(2, palette_success);
+        ansi_color(3, palette_warning);
+    }
+    json_object_put(root);
+
+    theme_titlebar_bg_active = surface;
+    theme_titlebar_bg_inactive = surface_alt;
+    theme_titlebar_fg_active = text;
+    theme_titlebar_fg_inactive = muted;
+    palette_accent = accent;
+    palette_accent_text = accent_text;
+    palette_error = error;
+    palette_border = border;
+    palette_muted = muted;
+    theme_button_bg = theme_titlebar_bg_inactive;
+    theme_button_hover_bg = palette_accent;
+    theme_button_active_bg = palette_border;
+    panel_palette_loaded = true;
+    return true;
+}
+
+/** Parse CSS color string to wf::color_t */
+wf::color_t decoration_theme_t::parse_css_color(const std::string& color_str) const
+{
+    wf::color_t color{0, 0, 0, 1.0};
+
+    if (color_str == "transparent")
+    {
+        return wf::color_t{0, 0, 0, 0};
+    }
+
+    if (color_str == "white")
+    {
+        return wf::color_t{1, 1, 1, 1};
+    }
+
+    // Match hex color: #rrggbb or #rrggbbaa
+    std::regex hex_regex("#([0-9a-fA-F]{6})([0-9a-fA-F]{2})?");
+    std::smatch hex_match;
+    if (std::regex_search(color_str, hex_match, hex_regex))
+    {
+        std::string hex = hex_match[1].str();
+        color.r = std::stoi(hex.substr(0, 2), nullptr, 16) / 255.0;
+        color.g = std::stoi(hex.substr(2, 2), nullptr, 16) / 255.0;
+        color.b = std::stoi(hex.substr(4, 2), nullptr, 16) / 255.0;
+
+        if (hex_match[2].matched)
+        {
+            color.a = std::stoi(hex_match[2].str(), nullptr, 16) / 255.0;
+        } else
+        {
+            color.a = 1.0;
+        }
+        return color;
+    }
+
+    // Match rgba: rgba(r, g, b, a)
+    std::regex rgba_regex(R"(rgba?\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*(?:,\s*([\d.]+))?\s*\))");
+    std::smatch rgba_match;
+    if (std::regex_search(color_str, rgba_match, rgba_regex))
+    {
+        color.r = std::stoi(rgba_match[1].str()) / 255.0;
+        color.g = std::stoi(rgba_match[2].str()) / 255.0;
+        color.b = std::stoi(rgba_match[3].str()) / 255.0;
+        color.a = rgba_match[4].matched ? std::stod(rgba_match[4].str()) : 1.0;
+        return color;
+    }
+
+    return color;  // Return black if parsing fails
+}
+
+/** Get current GTK theme name from settings */
+std::string decoration_theme_t::get_gtk_theme_name() const
+{
+    const char* home = getenv("HOME");
+    if (!home)
+    {
+        return "";
+    }
+
+    std::string settings_path = std::string(home) + "/.config/gtk-3.0/settings.ini";
+    std::ifstream settings_file(settings_path);
+    if (!settings_file.is_open())
+    {
+        return "";
+    }
+
+    std::string line;
+    while (std::getline(settings_file, line))
+    {
+        // cppcheck-suppress stlIfStrFind
+        if (line.find("gtk-theme-name=") == 0)
+        {
+            return line.substr(15);  // Length of "gtk-theme-name="
+        }
+    }
+
+    return "";
+}
+
+/** Get current icon theme name from settings */
+std::string decoration_theme_t::get_icon_theme_name() const
+{
+    const char* home = getenv("HOME");
+    if (!home)
+    {
+        return "hicolor"; // Default fallback
+    }
+
+    std::string settings_path = std::string(home) + "/.config/gtk-3.0/settings.ini";
+    std::ifstream settings_file(settings_path);
+    if (!settings_file.is_open())
+    {
+        return "hicolor";
+    }
+
+    std::string line;
+    while (std::getline(settings_file, line))
+    {
+        // cppcheck-suppress stlIfStrFind
+        if (line.find("gtk-icon-theme-name=") == 0)
+        {
+            return line.substr(20);  // Length of "gtk-icon-theme-name="
+        }
+    }
+
+    return "hicolor";
+}
+
+/** Get GTK font name from settings */
+std::string decoration_theme_t::get_gtk_font_name() const
+{
+    const char* home = getenv("HOME");
+    if (!home)
+    {
+        return "";
+    }
+
+    std::string settings_path = std::string(home) + "/.config/gtk-3.0/settings.ini";
+    std::ifstream settings_file(settings_path);
+    if (!settings_file.is_open())
+    {
+        return "";
+    }
+
+    std::string line;
+    while (std::getline(settings_file, line))
+    {
+        // cppcheck-suppress stlIfStrFind
+        if (line.find("gtk-font-name=") == 0)
+        {
+            return line.substr(14);  // Length of "gtk-font-name="
+        }
+    }
+
+    return "";
+}
+
+/** Find theme CSS file path */
+std::string decoration_theme_t::find_theme_css_file(const std::string& theme_name) const
+{
+    if (theme_name.empty())
+    {
+        return "";
+    }
+
+    const char* home = getenv("HOME");
+    std::vector<std::string> search_paths;
+
+    if (home)
+    {
+        search_paths.push_back(std::string(home) + "/.themes/" + theme_name + "/gtk-3.0/gtk.css");
+        search_paths.push_back(std::string(home) + "/.themes/" + theme_name + "/gtk-3.0/gtk-dark.css");
+        search_paths.push_back(std::string(home) + "/.local/share/themes/" + theme_name + "/gtk-3.0/gtk.css");
+        search_paths.push_back(std::string(home) + "/.local/share/themes/" + theme_name + "/gtk-3.0/gtk-dark.css");
+    }
+
+    search_paths.push_back("/usr/share/themes/" + theme_name + "/gtk-3.0/gtk.css");
+    search_paths.push_back("/usr/share/themes/" + theme_name + "/gtk-3.0/gtk-dark.css");
+    search_paths.push_back("/usr/local/share/themes/" + theme_name + "/gtk-3.0/gtk.css");
+
+    for (const auto& path : search_paths)
+    {
+        struct stat buffer;
+        if (stat(path.c_str(), &buffer) == 0)
+        {
+            return path;
+        }
+    }
+
+    return "";
+}
+
+/**
+ * Locate a metacity-1 titlebutton asset for the given button and state.
+ *
+ * Themes ship a full set of complete, pre-coloured button images under
+ * <theme>/metacity-1/. Two naming conventions are in use:
+ *
+ *   titlebuttons/titlebutton-<action>[-backdrop][-hover|-active].<ext>
+ *       WhiteSur, MacTahoe
+ *   <action>_<focused|unfocused>[_normal|_prelight|_pressed].<ext>
+ *       Nordic
+ *
+ * Unlike the symbolic icons used by the drawn style, these are not masks:
+ * the colour is baked in, so they are painted as-is.
+ */
+std::string decoration_theme_t::find_titlebutton_file(button_type_t button,
+    const button_state_t& state) const
+{
+    if (gtk_theme_name.empty())
+    {
+        return "";
+    }
+
+    std::string action;
+    switch (button)
+    {
+      case BUTTON_CLOSE:
+        action = "close";
+        break;
+
+      case BUTTON_TOGGLE_MAXIMIZE:
+        action = "maximize";
+        break;
+
+      case BUTTON_MINIMIZE:
+        action = "minimize";
+        break;
+
+      default:
+        return "";
+    }
+
+    const bool pressed = state.hover_progress < 0;
+    const bool hovered = state.hover_progress > 0;
+
+    /* Two naming conventions are in the wild, and a theme uses one or the
+     * other, so both are tried at each state:
+     *
+     *   WhiteSur, MacTahoe:  metacity-1/titlebuttons/titlebutton-close-hover.svg
+     *   Nordic:              metacity-1/close_focused_prelight.png
+     *
+     * Candidates are ordered most-specific-state first and degrade towards
+     * the plain button, since no theme ships every variant. */
+    std::vector<std::string> candidates;
+    auto add_state = [&] (const std::string& modern, const std::string& classic)
+    {
+        candidates.push_back("/metacity-1/titlebuttons/titlebutton-" + action + modern);
+        candidates.push_back("/metacity-1/" + action + classic);
+    };
+
+    if (!state.activated)
+    {
+        if (pressed)
+        {
+            add_state("-backdrop-active", "_unfocused_pressed");
+        }
+
+        if (hovered)
+        {
+            add_state("-backdrop-hover", "_unfocused_prelight");
+        }
+
+        add_state("-backdrop", "_unfocused");
+    } else if (pressed)
+    {
+        add_state("-active", "_focused_pressed");
+        add_state("-hover", "_focused_prelight");
+    } else if (hovered)
+    {
+        add_state("-hover", "_focused_prelight");
+    }
+
+    /* Least specific: the plain, focused button. */
+    candidates.push_back("/metacity-1/titlebuttons/titlebutton-" + action);
+    candidates.push_back("/metacity-1/" + action + "_focused_normal");
+    candidates.push_back("/metacity-1/" + action + "_focused");
+    candidates.push_back("/metacity-1/" + action);
+
+    const char *home = getenv("HOME");
+    std::vector<std::string> bases;
+    if (home)
+    {
+        bases.push_back(std::string(home) + "/.themes/");
+        bases.push_back(std::string(home) + "/.local/share/themes/");
+    }
+
+    bases.push_back("/usr/share/themes/");
+    bases.push_back("/usr/local/share/themes/");
+
+    for (const auto& candidate : candidates)
+    {
+        for (const auto& base : bases)
+        {
+            for (const auto *ext : {".svg", ".png"})
+            {
+                const std::string path = base + gtk_theme_name + candidate + ext;
+                struct stat buffer;
+                if (stat(path.c_str(), &buffer) == 0)
+                {
+                    return path;
+                }
+            }
+        }
+    }
+
+    return "";
+}
+
+/**
+ * Render a titlebutton asset at @size, cached so the SVG is not re-parsed on
+ * every frame of the hover animation.
+ */
+cairo_surface_t*decoration_theme_t::get_titlebutton_asset(const std::string& path, int size) const
+{
+    if (size <= 0)
+    {
+        return nullptr;
+    }
+
+    const std::string key = path + "@" + std::to_string(size);
+    auto it = titlebutton_cache.find(key);
+    if (it != titlebutton_cache.end())
+    {
+        return it->second;
+    }
+
+    cairo_surface_t *surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, size, size);
+    cairo_t *cr = cairo_create(surface);
+    cairo_set_antialias(cr, CAIRO_ANTIALIAS_BEST);
+    bool ok = false;
+
+    if (path.size() > 4 && path.compare(path.size() - 4, 4, ".png") == 0)
+    {
+        cairo_surface_t *png = cairo_image_surface_create_from_png(path.c_str());
+        if (cairo_surface_status(png) == CAIRO_STATUS_SUCCESS)
+        {
+            const double sw = cairo_image_surface_get_width(png);
+            const double sh = cairo_image_surface_get_height(png);
+            if ((sw > 0) && (sh > 0))
+            {
+                cairo_scale(cr, size / sw, size / sh);
+                cairo_set_source_surface(cr, png, 0, 0);
+                cairo_paint(cr);
+                ok = true;
+            }
+        }
+
+        cairo_surface_destroy(png);
+    }
+#ifdef HAVE_LIBRSVG
+    else
+    {
+        GError *error = NULL;
+        RsvgHandle *handle = rsvg_handle_new_from_file(path.c_str(), &error);
+        if (handle)
+        {
+            /* Full-bleed: the asset is the whole button, padding is the
+             * theme's business, not ours. */
+            RsvgRectangle viewport = {
+                .x = 0.0,
+                .y = 0.0,
+                .width  = (double)size,
+                .height = (double)size
+            };
+            ok = rsvg_handle_render_document(handle, cr, &viewport, &error);
+            g_object_unref(handle);
+        }
+
+        if (error)
+        {
+            LOGE("Failed to render titlebutton ", path, ": ", error->message);
+            g_error_free(error);
+        }
+    }
+#endif
+
+    cairo_destroy(cr);
+
+    if (!ok)
+    {
+        cairo_surface_destroy(surface);
+        titlebutton_cache[key] = nullptr;  // negative cache, don't retry every frame
+        return nullptr;
+    }
+
+    titlebutton_cache[key] = surface;
+    return surface;
+}
+
+/** Find icon file path in icon theme */
+std::string decoration_theme_t::find_icon_file(const std::string& icon_name, int size) const
+{
+    if (icon_theme_name.empty() || icon_name.empty())
+    {
+        return "";
+    }
+
+    const char* home = getenv("HOME");
+    std::vector<std::string> base_paths;
+
+    if (home)
+    {
+        base_paths.push_back(std::string(home) + "/.icons");
+        base_paths.push_back(std::string(home) + "/.local/share/icons");
+    }
+    base_paths.push_back("/usr/share/icons");
+    base_paths.push_back("/usr/local/share/icons");
+
+    // Common size directories to check
+    std::vector<std::string> size_dirs = {
+        "symbolic",
+        std::to_string(size) + "x" + std::to_string(size),
+        "scalable",
+        "16x16", "22x22", "24x24", "32x32", "48x48"
+    };
+
+    // Common subdirectories for window controls
+    std::vector<std::string> sub_dirs = {
+        "actions", "ui", "status", "places"
+    };
+
+    for (const auto& base : base_paths)
+    {
+        for (const auto& size_dir : size_dirs)
+        {
+            for (const auto& sub_dir : sub_dirs)
+            {
+                // Try both possible directory orderings for maximum compatibility
+                // Pattern 1: theme/size/subdir/icon (e.g., Adwaita/symbolic/ui/icon.svg)
+                std::string path = base + "/" + icon_theme_name + "/" + size_dir + "/" + sub_dir + "/" + icon_name + ".svg";
+                struct stat buffer;
+                if (stat(path.c_str(), &buffer) == 0)
+                {
+                    return path;
+                }
+
+                // Pattern 2: theme/subdir/size/icon (e.g., elementary/actions/symbolic/icon.svg)
+                path = base + "/" + icon_theme_name + "/" + sub_dir + "/" + size_dir + "/" + icon_name + ".svg";
+                if (stat(path.c_str(), &buffer) == 0)
+                {
+                    return path;
+                }
+
+                // Try PNG for both patterns
+                path = base + "/" + icon_theme_name + "/" + size_dir + "/" + sub_dir + "/" + icon_name + ".png";
+                if (stat(path.c_str(), &buffer) == 0)
+                {
+                    return path;
+                }
+
+                path = base + "/" + icon_theme_name + "/" + sub_dir + "/" + size_dir + "/" + icon_name + ".png";
+                if (stat(path.c_str(), &buffer) == 0)
+                {
+                    return path;
+                }
+            }
+
+            // Also try without subdirectory
+            std::string path = base + "/" + icon_theme_name + "/" + size_dir + "/" + icon_name + ".svg";
+            struct stat buffer;
+            if (stat(path.c_str(), &buffer) == 0)
+            {
+                return path;
+            }
+
+            path = base + "/" + icon_theme_name + "/" + size_dir + "/" + icon_name + ".png";
+            if (stat(path.c_str(), &buffer) == 0)
+            {
+                return path;
+            }
+        }
+    }
+
+    // Fallback to Adwaita if icon not found in theme
+    if (icon_theme_name != "Adwaita")
+    {
+        for (const auto& base : base_paths)
+        {
+            std::string path = base + "/Adwaita/symbolic/ui/" + icon_name + ".svg";
+            struct stat buffer;
+            if (stat(path.c_str(), &buffer) == 0)
+            {
+                return path;
+            }
+        }
+    }
+
+    return "";
+}
+
+/**
+ * Read the colours a theme gives its window buttons in the stylesheet.
+ *
+ * Colloid has no button images of its own to load: its traffic lights exist
+ * only as rules like button.close.titlebutton { background-color: #bf616a; }.
+ * Only the plain selectors count; the longer ones that also match are specific
+ * to client-side headerbars.
+ *
+ * Many themes declare these rules with one neutral colour for all three
+ * buttons. That is not colour-coding, so those keep the default drawn style.
+ */
+void decoration_theme_t::parse_titlebutton_colors(std::string css) const
+{
+    for (size_t start = css.find("/*"); start != std::string::npos; start = css.find("/*", start))
+    {
+        const size_t end = css.find("*/", start);
+        css.erase(start, end == std::string::npos ? end : end + 2 - start);
+    }
+
+    auto trim = [] (const std::string& text)
+    {
+        const char *space = " \t\r\n";
+        const size_t first = text.find_first_not_of(space);
+        return (first == std::string::npos) ? std::string{} :
+               text.substr(first, text.find_last_not_of(space) - first + 1);
+    };
+
+    /* "<selector>/<property>" -> value, later rules overriding earlier ones */
+    std::map<std::string, std::string> declared;
+    const std::regex not_regex(R"(:not\([^)]*\))");
+
+    size_t pos = 0;
+    while (true)
+    {
+        const size_t open = css.find_first_of("{}", pos);
+        if (open == std::string::npos)
+        {
+            break;
+        }
+
+        /* A stray '}' closes a nested block such as @keyframes */
+        if (css[open] == '}')
+        {
+            pos = open + 1;
+            continue;
+        }
+
+        const size_t close = css.find('}', open);
+        if (close == std::string::npos)
+        {
+            break;
+        }
+
+        std::string selectors = css.substr(pos, open - pos);
+        const std::string body = css.substr(open + 1, close - open - 1);
+        pos = close + 1;
+
+        if (selectors.find(".titlebutton") == std::string::npos)
+        {
+            continue;
+        }
+
+        /* Drop any at-statement such as @define-color ahead of the rule */
+        const size_t statement_end = selectors.rfind(';');
+        if (statement_end != std::string::npos)
+        {
+            selectors.erase(0, statement_end + 1);
+        }
+
+        selectors = std::regex_replace(selectors, not_regex, "");
+
+        std::stringstream selector_list(selectors);
+        std::string selector;
+        while (std::getline(selector_list, selector, ','))
+        {
+            selector = trim(selector);
+
+            std::stringstream declarations(body);
+            std::string declaration;
+            while (std::getline(declarations, declaration, ';'))
+            {
+                const size_t colon = declaration.find(':');
+                if (colon == std::string::npos)
+                {
+                    continue;
+                }
+
+                const std::string property = trim(declaration.substr(0, colon));
+                if ((property == "background-color") || (property == "color"))
+                {
+                    declared[selector + "/" + property] = trim(declaration.substr(colon + 1));
+                }
+            }
+        }
+    }
+
+    auto value_of = [&] (const std::string& action, const std::string& pseudo,
+                         const std::string& property)
+    {
+        auto it = declared.find("button." + action + ".titlebutton" + pseudo + "/" + property);
+        return (it == declared.end()) ? std::string{} : it->second;
+    };
+
+    const std::string close_bg    = value_of("close", "", "background-color");
+    const std::string minimize_bg = value_of("minimize", "", "background-color");
+    const std::string maximize_bg = value_of("maximize", "", "background-color");
+    if (close_bg.empty() || minimize_bg.empty() || maximize_bg.empty() ||
+        ((close_bg == minimize_bg) && (close_bg == maximize_bg)))
+    {
+        return;
+    }
+
+    const std::pair<button_type_t, std::string> buttons[] = {
+        {BUTTON_CLOSE, "close"},
+        {BUTTON_MINIMIZE, "minimize"},
+        {BUTTON_TOGGLE_MAXIMIZE, "maximize"},
+    };
+
+    for (const auto& [button, action] : buttons)
+    {
+        auto color_of = [&, &action = action] (const std::string& pseudo,
+                                               const std::string& property, wf::color_t fallback)
+        {
+            const std::string value = value_of(action, pseudo, property);
+            return value.empty() ? fallback : parse_css_color(value);
+        };
+
+        titlebutton_colors_t colors;
+        colors.bg = parse_css_color(value_of(action, "", "background-color"));
+        colors.pressed_bg  = color_of(":active", "background-color", colors.bg);
+        colors.backdrop_bg = color_of(":backdrop", "background-color", colors.bg);
+        colors.fg = color_of("", "color", wf::color_t{1, 1, 1, 1});
+        colors.hover_fg = color_of(":hover", "color", colors.fg);
+        colors.backdrop_hover_fg = color_of(":backdrop:hover", "color", colors.hover_fg);
+        titlebutton_colors[button] = colors;
+    }
+
+    LOGI("Theme colours its window buttons individually");
+}
+
+/** Parse theme CSS file and extract colors */
+void decoration_theme_t::parse_theme_css(const std::string& css_file) const
+{
+    std::ifstream file(css_file);
+    if (!file.is_open())
+    {
+        LOGE("Failed to open theme CSS file: ", css_file);
+        return;
+    }
+
+    std::stringstream buffer;
+    buffer << file.rdbuf();
+    std::string css_content = buffer.str();
+
+    // Build map of @define-color variables
+    std::map<std::string, std::string> color_vars;
+    std::regex define_color_regex(R"(@define-color\s+(\w+)\s+([^;]+);)");
+    std::smatch match;
+    std::string::const_iterator searchStart(css_content.cbegin());
+    while (std::regex_search(searchStart, css_content.cend(), match, define_color_regex))
+    {
+        color_vars[match[1].str()] = match[2].str();
+        searchStart = match.suffix().first;
+    }
+
+    // Try to find background color from @define-color theme_bg_color or theme_unfocused_bg_color
+    if (color_vars.count("theme_bg_color"))
+    {
+        theme_titlebar_bg_active = parse_css_color(color_vars["theme_bg_color"]);
+        LOGI("Using theme_bg_color for titlebar background");
+    }
+
+    if (color_vars.count("theme_unfocused_bg_color"))
+    {
+        theme_titlebar_bg_inactive = parse_css_color(color_vars["theme_unfocused_bg_color"]);
+    } else
+    {
+        theme_titlebar_bg_inactive = theme_titlebar_bg_active;
+    }
+
+    // Try to find foreground/text color
+    if (color_vars.count("theme_fg_color"))
+    {
+        theme_titlebar_fg_active = parse_css_color(color_vars["theme_fg_color"]);
+        LOGI("Using theme_fg_color for titlebar text");
+    }
+
+    if (color_vars.count("theme_unfocused_fg_color"))
+    {
+        theme_titlebar_fg_inactive = parse_css_color(color_vars["theme_unfocused_fg_color"]);
+    } else if (color_vars.count("unfocused_insensitive_color"))
+    {
+        theme_titlebar_fg_inactive = parse_css_color(color_vars["unfocused_insensitive_color"]);
+    } else
+    {
+        theme_titlebar_fg_inactive = theme_titlebar_fg_active;
+    }
+
+    parse_titlebutton_colors(css_content);
+
+    /* Colour-coded buttons are designed for the titlebar the theme exports to
+     * window managers, which can differ from the window background: Colloid
+     * pairs a dark wm_bg with a white theme_bg_color, and its unfocused
+     * buttons are translucent white. */
+    if (!titlebutton_colors.empty())
+    {
+        auto use_wm_color = [&] (const char *name, wf::color_t& color)
+        {
+            if (color_vars.count(name))
+            {
+                color = parse_css_color(color_vars[name]);
+            }
+        };
+
+        use_wm_color("wm_bg", theme_titlebar_bg_active);
+        use_wm_color("wm_unfocused_bg", theme_titlebar_bg_inactive);
+        use_wm_color("wm_title", theme_titlebar_fg_active);
+        use_wm_color("wm_unfocused_title", theme_titlebar_fg_inactive);
+    }
+
+    // Set button colors - matching GTK style (visible circular backgrounds)
+    theme_button_bg = wf::color_t{0.4, 0.4, 0.4, 0.3};  // Gray circle in normal state
+    theme_button_hover_bg = wf::color_t{0.5, 0.5, 0.5, 0.4};  // Lighter on hover
+    theme_button_active_bg = wf::color_t{0.3, 0.3, 0.3, 0.5};  // Darker when pressed
+
+    // Try to find font settings - look for window.titlebar or headerbar font
+    std::regex font_regex(R"(font-family:\s*([^;]+);)");
+    std::regex font_size_regex(R"(font-size:\s*(\d+)(?:px|pt)?)");
+    std::smatch font_match;
+
+    // Search for headerbar or window titlebar font settings
+    std::string::const_iterator font_search_start(css_content.cbegin());
+    if (std::regex_search(font_search_start, css_content.cend(), font_match, font_regex))
+    {
+        theme_font_family = font_match[1].str();
+        // Remove quotes if present
+        theme_font_family.erase(std::remove(theme_font_family.begin(), theme_font_family.end(), '"'),
+                                theme_font_family.end());
+        theme_font_family.erase(std::remove(theme_font_family.begin(), theme_font_family.end(), '\''),
+                                theme_font_family.end());
+        LOGI("Found theme font family: ", theme_font_family);
+    }
+
+    if (std::regex_search(css_content, font_match, font_size_regex))
+    {
+        theme_font_size = std::stoi(font_match[1].str());
+        LOGI("Found theme font size: ", theme_font_size);
+    }
+
+    LOGI("Parsed GTK theme colors from: ", css_file);
+    LOGI("Titlebar bg active: rgba(",
+         int(theme_titlebar_bg_active.r * 255), ", ",
+         int(theme_titlebar_bg_active.g * 255), ", ",
+         int(theme_titlebar_bg_active.b * 255), ", ",
+         theme_titlebar_bg_active.a, ")");
+}
+
+/** Load GTK theme by parsing CSS files */
+void decoration_theme_t::load_gtk_theme() const
+{
+    if (theme_loaded)
+    {
+        return;
+    }
+
+    theme_loaded = true;  // Mark as attempted even if it fails
+
+    // The same palette file drives the Quickshell panel and dock.
+    if (load_panel_palette())
+    {
+        return;
+    }
+
+    // Get icon theme name from GTK settings
+    icon_theme_name = get_icon_theme_name();
+    LOGI("Found icon theme: ", icon_theme_name);
+
+    // Get font name from GTK settings
+    std::string gtk_font = get_gtk_font_name();
+    LOGI("GTK font from settings.ini: '", gtk_font, "'");
+
+    // Store whether we got font from GTK settings (to prevent CSS from overwriting it)
+    bool gtk_font_found = false;
+    if (!gtk_font.empty())
+    {
+        // Parse font string (format: "Font Name Size")
+        size_t last_space = gtk_font.rfind(' ');
+        if (last_space != std::string::npos)
+        {
+            theme_font_family = gtk_font.substr(0, last_space);
+            try {
+                theme_font_size = std::stoi(gtk_font.substr(last_space + 1));
+                gtk_font_found = true;  // Successfully parsed GTK font
+            } catch (...) {
+                theme_font_size = 11; // Default size
+            }
+            LOGI("Parsed font family: '", theme_font_family, "', size: ", theme_font_size);
+        }
+    }
+
+    // Get theme name from GTK settings
+    std::string theme_name = get_gtk_theme_name();
+    gtk_theme_name = theme_name;  // cached for titlebutton asset lookup
+    if (theme_name.empty())
+    {
+        LOGE("Could not determine GTK theme name, using fallback colors");
+        // Set default font if not found from GTK settings
+        if (!gtk_font_found)
+        {
+            theme_font_family = "Sans";
+            theme_font_size = 10;
+        }
+        return;
+    }
+
+    LOGI("Found GTK theme: ", theme_name);
+
+    // Find theme CSS file
+    std::string css_file = find_theme_css_file(theme_name);
+    if (css_file.empty())
+    {
+        LOGE("Could not find CSS file for theme: ", theme_name);
+        // Set default font if not found from GTK settings
+        if (!gtk_font_found)
+        {
+            theme_font_family = "Sans";
+            theme_font_size = 10;
+        }
+        return;
+    }
+
+    LOGI("Loading theme CSS from: ", css_file);
+
+    // Save GTK font before parsing CSS (CSS might overwrite it)
+    std::string saved_font_family = theme_font_family;
+    int saved_font_size = theme_font_size;
+
+    // Parse the CSS file
+    parse_theme_css(css_file);
+
+    // Restore GTK font if it was found (prioritize settings.ini over CSS)
+    if (gtk_font_found)
+    {
+        theme_font_family = saved_font_family;
+        theme_font_size = saved_font_size;
+    }
+    // Otherwise use CSS font if available, or default
+    else if (theme_font_family.empty())
+    {
+        theme_font_family = "Sans";
+        theme_font_size = 10;
+    }
+}
+
+/** Create a new theme with the default parameters */
+decoration_theme_t::decoration_theme_t() :
+    button_flags{},
+    theme_loaded(false),
+    theme_titlebar_bg_active{0.1, 0.1, 0.15, 1.0},
+    theme_titlebar_bg_inactive{0.15, 0.15, 0.2, 1.0},
+    theme_titlebar_fg_active{0.9, 0.9, 0.93, 1.0},
+    theme_titlebar_fg_inactive{0.7, 0.7, 0.73, 0.7},
+    theme_button_bg{0.4, 0.4, 0.4, 0.3},
+    theme_button_hover_bg{0.5, 0.5, 0.5, 0.4},
+    theme_button_active_bg{0.3, 0.3, 0.3, 0.5},
+    theme_font_family(""),
+    theme_font_size(0),
+    palette_error{1.0, 0.38, 0.35, 1.0},
+    palette_warning{0.96, 0.74, 0.32, 1.0},
+    palette_success{0.38, 0.77, 0.35, 1.0}
+{
+}
+
+decoration_theme_t::~decoration_theme_t()
+{
+    clear_titlebutton_cache();
+}
+
+void decoration_theme_t::clear_titlebutton_cache() const
+{
+    for (auto& [key, surface] : titlebutton_cache)
+    {
+        cairo_surface_destroy(surface);
+    }
+
+    titlebutton_cache.clear();
+}
+
+/** Force reload of theme - call when GTK theme/icon theme changes */
+void decoration_theme_t::reload_theme() const
+{
+    LOGI("Reloading GTK theme and icons");
+    invalidate_cache();
+    clear_titlebutton_cache();
+    titlebutton_colors.clear();
+    theme_loaded = false;
+    panel_palette_loaded = false;
+    icon_theme_name.clear();
+    gtk_theme_name.clear();
+    theme_font_family.clear();
+    theme_font_size = 0;
+    // Reset colors to defaults - they'll be reloaded
+    theme_titlebar_bg_active = wf::color_t{0.1, 0.1, 0.15, 1.0};
+    theme_titlebar_bg_inactive = wf::color_t{0.15, 0.15, 0.2, 1.0};
+    theme_titlebar_fg_active = wf::color_t{0.9, 0.9, 0.93, 1.0};
+    theme_titlebar_fg_inactive = wf::color_t{0.7, 0.7, 0.73, 0.7};
+}
+
+/** @return The available height for displaying the title */
+int decoration_theme_t::get_title_height() const
+{
+    return title_height;
+}
+
+int decoration_theme_t::get_button_size() const
+{
+    return std::min((int)button_size, (int)title_height);
+}
+
+/** @return The available border for resizing */
+int decoration_theme_t::get_border_size() const
+{
+    return border_size;
+}
+
+/** @return The corner radius for rounded titlebar */
+int decoration_theme_t::get_corner_radius() const
+{
+    return corner_radius;
+}
+
+/** @return The available border for resizing */
+void decoration_theme_t::set_buttons(button_type_t flags)
+{
+    button_flags = flags;
+}
+
+void decoration_theme_t::invalidate_cache() const
+{
+    bg_cache.valid = false;
+}
+
+/**
+ * Fill the given rectangle with the background color(s).
+ *
+ * @param data The render data (pass, target, damage)
+ * @param rectangle The rectangle to redraw.
+ * @param active Whether to use active or inactive colors
+ */
+void decoration_theme_t::render_background(const wf::scene::render_instruction_t& data,
+    wf::geometry_t rectangle, bool active) const
+{
+    // Lazy initialization: load GTK theme on first render
+    load_gtk_theme();
+
+    // Check if cached surfaces are still valid
+    bool cache_hit = bg_cache.valid &&
+        bg_cache.geometry.width == rectangle.width &&
+        bg_cache.geometry.height == rectangle.height &&
+        bg_cache.active == active;
+
+    if (cache_hit)
+    {
+        // Just re-submit cached textures
+        if (bg_cache.titlebar_tex)
+        {
+            data.pass->add_texture(bg_cache.titlebar_tex->get_texture(),
+                data.target, bg_cache.titlebar_rect + wf::pointf_t{rectangle.x, rectangle.y}
+                    - wf::pointf_t{bg_cache.geometry.x, bg_cache.geometry.y}, data.damage);
+        }
+        if (bg_cache.left_tex)
+        {
+            data.pass->add_texture(bg_cache.left_tex->get_texture(),
+                data.target, bg_cache.left_rect + wf::pointf_t{rectangle.x, rectangle.y}
+                    - wf::pointf_t{bg_cache.geometry.x, bg_cache.geometry.y}, data.damage);
+        }
+        if (bg_cache.right_tex)
+        {
+            data.pass->add_texture(bg_cache.right_tex->get_texture(),
+                data.target, bg_cache.right_rect + wf::pointf_t{rectangle.x, rectangle.y}
+                    - wf::pointf_t{bg_cache.geometry.x, bg_cache.geometry.y}, data.damage);
+        }
+        if (bg_cache.bottom_tex)
+        {
+            data.pass->add_texture(bg_cache.bottom_tex->get_texture(),
+                data.target, bg_cache.bottom_rect + wf::pointf_t{rectangle.x, rectangle.y}
+                    - wf::pointf_t{bg_cache.geometry.x, bg_cache.geometry.y}, data.damage);
+        }
+        if (bg_cache.outline_tex)
+        {
+            data.pass->add_texture(bg_cache.outline_tex->get_texture(),
+                data.target, bg_cache.outline_rect + wf::pointf_t{rectangle.x, rectangle.y}
+                    - wf::pointf_t{bg_cache.geometry.x, bg_cache.geometry.y}, data.damage);
+        }
+        return;
+    }
+
+    // Cache miss — regenerate all surfaces
+    bg_cache.geometry = rectangle;
+    bg_cache.active = active;
+    bg_cache.valid = true;
+
+    // Use theme colors if available, otherwise fall back to config colors
+    wf::color_t bg_color = active ? theme_titlebar_bg_active : theme_titlebar_bg_inactive;
+
+    // If theme colors are still default (black), use config colors as ultimate fallback
+    if (bg_color.r == 0.0 && bg_color.g == 0.0 && bg_color.b == 0.0)
+    {
+        bg_color = active ? active_color : inactive_color;
+    }
+
+    // Use the selected palette's border when available.
+    wf::color_t outline_color;
+    if (panel_palette_loaded)
+    {
+        outline_color = palette_border;
+        outline_color.a = active ? 0.55 : 0.25;
+    } else
+    {
+        outline_color = wf::color_t{1.0, 1.0, 1.0, 0.10};
+    }
+
+    // Calculate titlebar area (top portion with rounded corners)
+    int titlebar_h = title_height + border_size;
+    const int radius = std::clamp((int)corner_radius, 0,
+        std::max(0, (int)(std::min(rectangle.width, rectangle.height) / 2)));
+    wf::geometry_t titlebar_rect = {
+        rectangle.x, rectangle.y,
+        rectangle.width, (double)titlebar_h
+    };
+
+    // Shadow parameters
+    int shadow_offset = 2;
+    const int shadow_blur = decoration_shadow_blur;
+
+    // --- Titlebar surface ---
+    {
+        auto titlebar_surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32,
+            titlebar_rect.width + shadow_blur * 2, titlebar_rect.height + shadow_blur);
+        auto cr = cairo_create(titlebar_surface);
+
+        cairo_set_operator(cr, CAIRO_OPERATOR_CLEAR);
+        cairo_paint(cr);
+        cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
+
+        double x = shadow_blur, y = shadow_blur;
+        double w = titlebar_rect.width, h = titlebar_rect.height;
+
+        auto draw_rounded_rect_path = [&]() {
+            cairo_new_sub_path(cr);
+            cairo_arc(cr, x + radius, y + radius, radius, M_PI, 3 * M_PI / 2);
+            cairo_line_to(cr, x + w - radius, y);
+            cairo_arc(cr, x + w - radius, y + radius, radius, -M_PI / 2, 0);
+            cairo_line_to(cr, x + w, y + h);
+            cairo_line_to(cr, x, y + h);
+            cairo_close_path(cr);
+        };
+
+        // Drop shadow
+        for (int i = shadow_blur; i > 0; i--)
+        {
+            cairo_save(cr);
+            cairo_new_sub_path(cr);
+            double shadow_x = shadow_blur + 0.5;
+            double shadow_y = shadow_blur + shadow_offset + 0.5;
+            cairo_arc(cr, shadow_x + radius, shadow_y + radius, radius, M_PI, 3 * M_PI / 2);
+            cairo_line_to(cr, shadow_x + w - radius, shadow_y);
+            cairo_arc(cr, shadow_x + w - radius, shadow_y + radius, radius, -M_PI / 2, 0);
+            cairo_line_to(cr, shadow_x + w, shadow_y + h);
+            cairo_line_to(cr, shadow_x, shadow_y + h);
+            cairo_close_path(cr);
+
+            double alpha = 0.1 * (1.0 - (double)i / shadow_blur);
+            cairo_set_source_rgba(cr, 0, 0, 0, alpha);
+            cairo_set_line_width(cr, i * 2.0);
+            cairo_stroke(cr);
+            cairo_restore(cr);
+        }
+
+        draw_rounded_rect_path();
+        cairo_set_source_rgba(cr, bg_color.r, bg_color.g, bg_color.b, bg_color.a);
+        cairo_fill(cr);
+        cairo_destroy(cr);
+
+        bg_cache.titlebar_rect = {
+            titlebar_rect.x - shadow_blur,
+            titlebar_rect.y - shadow_blur,
+            titlebar_rect.width + shadow_blur * 2,
+            titlebar_rect.height + shadow_blur
+        };
+        bg_cache.titlebar_tex = std::make_unique<wf::owned_texture_t>(titlebar_surface);
+        data.pass->add_texture(bg_cache.titlebar_tex->get_texture(), data.target,
+            bg_cache.titlebar_rect, data.damage);
+        cairo_surface_destroy(titlebar_surface);
+    }
+
+    // --- Left border ---
+    if (border_size > 0)
+    {
+        int border_h = rectangle.height - 2 * radius + 1;
+        auto left_surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32,
+            border_size + shadow_blur, border_h);
+        auto left_cr = cairo_create(left_surface);
+
+        cairo_set_operator(left_cr, CAIRO_OPERATOR_CLEAR);
+        cairo_paint(left_cr);
+        cairo_set_operator(left_cr, CAIRO_OPERATOR_OVER);
+
+        for (int i = shadow_blur; i > 0; i--)
+        {
+            double alpha = 0.1 * (1.0 - (double)i / shadow_blur);
+            cairo_set_source_rgba(left_cr, 0, 0, 0, alpha);
+            cairo_set_line_width(left_cr, i * 2.0);
+            cairo_move_to(left_cr, shadow_blur + 0.5, 0);
+            cairo_line_to(left_cr, shadow_blur + 0.5, border_h);
+            cairo_stroke(left_cr);
+        }
+
+        cairo_set_source_rgba(left_cr, bg_color.r, bg_color.g, bg_color.b, bg_color.a);
+        cairo_rectangle(left_cr, shadow_blur, 0, border_size, border_h);
+        cairo_fill(left_cr);
+        cairo_destroy(left_cr);
+
+        bg_cache.left_rect = {
+            rectangle.x - shadow_blur, rectangle.y + radius - 1,
+            (double)(border_size + shadow_blur), (double)border_h
+        };
+        bg_cache.left_tex = std::make_unique<wf::owned_texture_t>(left_surface);
+        data.pass->add_texture(bg_cache.left_tex->get_texture(), data.target,
+            bg_cache.left_rect, data.damage);
+        cairo_surface_destroy(left_surface);
+    }
+
+    // --- Right border ---
+    if (border_size > 0)
+    {
+        int border_h = rectangle.height - 2 * radius + 1;
+        auto right_surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32,
+            border_size + shadow_blur, border_h);
+        auto right_cr = cairo_create(right_surface);
+
+        cairo_set_operator(right_cr, CAIRO_OPERATOR_CLEAR);
+        cairo_paint(right_cr);
+        cairo_set_operator(right_cr, CAIRO_OPERATOR_OVER);
+
+        for (int i = shadow_blur; i > 0; i--)
+        {
+            double alpha = 0.1 * (1.0 - (double)i / shadow_blur);
+            cairo_set_source_rgba(right_cr, 0, 0, 0, alpha);
+            cairo_set_line_width(right_cr, i * 2.0);
+            cairo_move_to(right_cr, border_size - 0.5, 0);
+            cairo_line_to(right_cr, border_size - 0.5, border_h);
+            cairo_stroke(right_cr);
+        }
+
+        cairo_set_source_rgba(right_cr, bg_color.r, bg_color.g, bg_color.b, bg_color.a);
+        cairo_rectangle(right_cr, 0, 0, border_size, border_h);
+        cairo_fill(right_cr);
+        cairo_destroy(right_cr);
+
+        bg_cache.right_rect = {
+            rectangle.x + rectangle.width - border_size, rectangle.y + radius - 1,
+            (double)(border_size + shadow_blur), (double)border_h
+        };
+        bg_cache.right_tex = std::make_unique<wf::owned_texture_t>(right_surface);
+        data.pass->add_texture(bg_cache.right_tex->get_texture(), data.target,
+            bg_cache.right_rect, data.damage);
+        cairo_surface_destroy(right_surface);
+    }
+
+    // --- Bottom border with rounded bottom corners ---
+    if (border_size > 0)
+    {
+        double br = radius;
+        int bottom_h = border_size + (int)br;  // Extra height for corner arcs
+        int surface_w = rectangle.width + shadow_blur * 2;
+        int surface_h = bottom_h + shadow_blur;
+        auto bottom_surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32,
+            surface_w, surface_h);
+        auto bottom_cr = cairo_create(bottom_surface);
+
+        cairo_set_operator(bottom_cr, CAIRO_OPERATOR_CLEAR);
+        cairo_paint(bottom_cr);
+        cairo_set_operator(bottom_cr, CAIRO_OPERATOR_OVER);
+
+        // Draw shadow along the bottom with rounded corners
+        for (int i = shadow_blur; i > 0; i--)
+        {
+            double alpha = 0.1 * (1.0 - (double)i / shadow_blur);
+            cairo_set_source_rgba(bottom_cr, 0, 0, 0, alpha);
+            cairo_set_line_width(bottom_cr, i * 2.0);
+
+            double sx = shadow_blur;
+            double sy = shadow_offset;
+            double sw = rectangle.width;
+
+            cairo_new_sub_path(bottom_cr);
+            cairo_move_to(bottom_cr, sx, sy + 0.5);
+            cairo_line_to(bottom_cr, sx + sw, sy + 0.5);
+            cairo_line_to(bottom_cr, sx + sw, sy + bottom_h - br + 0.5);
+            cairo_arc(bottom_cr, sx + sw - br, sy + bottom_h - br + 0.5, br, 0, M_PI / 2);
+            cairo_line_to(bottom_cr, sx + br, sy + bottom_h + 0.5);
+            cairo_arc(bottom_cr, sx + br, sy + bottom_h - br + 0.5, br, M_PI / 2, M_PI);
+            cairo_close_path(bottom_cr);
+            cairo_stroke(bottom_cr);
+        }
+
+        // Fill bottom area with rounded bottom corners
+        double bx = shadow_blur;
+        double by = 0;
+        double bw = rectangle.width;
+
+        cairo_new_sub_path(bottom_cr);
+        cairo_move_to(bottom_cr, bx, by);
+        cairo_line_to(bottom_cr, bx + bw, by);
+        cairo_line_to(bottom_cr, bx + bw, by + bottom_h - br);
+        cairo_arc(bottom_cr, bx + bw - br, by + bottom_h - br, br, 0, M_PI / 2);
+        cairo_line_to(bottom_cr, bx + br, by + bottom_h);
+        cairo_arc(bottom_cr, bx + br, by + bottom_h - br, br, M_PI / 2, M_PI);
+        cairo_close_path(bottom_cr);
+
+        cairo_set_source_rgba(bottom_cr, bg_color.r, bg_color.g, bg_color.b, bg_color.a);
+        cairo_fill(bottom_cr);
+        cairo_destroy(bottom_cr);
+
+        bg_cache.bottom_rect = {
+            rectangle.x - shadow_blur,
+            rectangle.y + rectangle.height - border_size - (int)br,
+            (double)surface_w, (double)surface_h
+        };
+        bg_cache.bottom_tex = std::make_unique<wf::owned_texture_t>(bottom_surface);
+        data.pass->add_texture(bg_cache.bottom_tex->get_texture(), data.target,
+            bg_cache.bottom_rect, data.damage);
+        cairo_surface_destroy(bottom_surface);
+    }
+
+    // The outline is part of the configured border. With a zero-width border,
+    // drawing it would leave a lone one-pixel line above the title bar.
+    if (border_size > 0)
+    {
+        auto outline_surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32,
+            rectangle.width, rectangle.height);
+        auto outline_cr = cairo_create(outline_surface);
+
+        cairo_set_operator(outline_cr, CAIRO_OPERATOR_CLEAR);
+        cairo_paint(outline_cr);
+        cairo_set_operator(outline_cr, CAIRO_OPERATOR_OVER);
+
+        double r = radius;
+        double br = radius;
+        double w = rectangle.width;
+        double h = rectangle.height;
+
+        cairo_new_sub_path(outline_cr);
+        // Top-left arc
+        cairo_arc(outline_cr, 0.5 + r, 0.5 + r, r, M_PI, 3 * M_PI / 2);
+        // Top-right arc
+        cairo_arc(outline_cr, w - 0.5 - r, 0.5 + r, r, -M_PI / 2, 0);
+        // Down to bottom-right arc
+        cairo_line_to(outline_cr, w - 0.5, h - 0.5 - br);
+        cairo_arc(outline_cr, w - 0.5 - br, h - 0.5 - br, br, 0, M_PI / 2);
+        // Across bottom to bottom-left arc
+        cairo_arc(outline_cr, 0.5 + br, h - 0.5 - br, br, M_PI / 2, M_PI);
+        // Close path (up left side)
+        cairo_close_path(outline_cr);
+
+        cairo_set_source_rgba(outline_cr, outline_color.r, outline_color.g,
+            outline_color.b, outline_color.a);
+        cairo_set_line_width(outline_cr, 1.0);
+        cairo_stroke(outline_cr);
+        cairo_destroy(outline_cr);
+
+        bg_cache.outline_rect = {
+            rectangle.x, rectangle.y,
+            rectangle.width, rectangle.height
+        };
+        bg_cache.outline_tex = std::make_unique<wf::owned_texture_t>(outline_surface);
+        data.pass->add_texture(bg_cache.outline_tex->get_texture(), data.target,
+            bg_cache.outline_rect, data.damage);
+        cairo_surface_destroy(outline_surface);
+    }
+}
+
+/**
+ * Render the given text on a cairo_surface_t with the given size.
+ * The caller is responsible for freeing the memory afterwards.
+ */
+cairo_surface_t*decoration_theme_t::render_text(const std::string& text,
+    int width, int height, int button_area_width, double scale) const
+{
+    const auto format = CAIRO_FORMAT_ARGB32;
+    auto surface = cairo_image_surface_create(format, width, height);
+
+    if (height == 0)
+    {
+        return surface;
+    }
+
+    // Lazy initialization: load GTK theme to get font settings
+    load_gtk_theme();
+
+    wf::color_t color = theme_titlebar_fg_active;
+    // Use config font color as fallback
+    if (color.r == 0.0 && color.g == 0.0 && color.b == 0.0)
+    {
+        color = font_color;
+    }
+
+    auto cr = cairo_create(surface);
+
+    PangoFontDescription *font_desc;
+    PangoLayout *layout;
+
+    // Keep the GTK font family while letting the title size change live.
+    std::string gtk_font_now = get_gtk_font_name();
+    std::string font_to_use;
+    // A capped offscreen buffer is rendered below logical scale and enlarged
+    // afterwards. Keep the title's logical size when this happens.
+    const int configured_size = std::max(1,
+        static_cast<int>(std::lround(int(title_font_size) * std::min(1.0, scale))));
+
+    if (!gtk_font_now.empty())
+    {
+        // Parse the GTK font (format: "Font Name Weight Size")
+        size_t last_space = gtk_font_now.rfind(' ');
+        if (last_space != std::string::npos)
+        {
+            std::string font_family = gtk_font_now.substr(0, last_space);
+            font_to_use = font_family + " Bold " + std::to_string(configured_size);
+        }
+        else
+        {
+            font_to_use = gtk_font_now + " Bold " + std::to_string(configured_size);
+        }
+    }
+    else
+    {
+        // Fallback if GTK font can't be read
+        font_to_use = "Sans Bold " + std::to_string(configured_size);
+    }
+
+    font_desc = pango_font_description_from_string(font_to_use.c_str());
+
+    layout = pango_cairo_create_layout(cr);
+    pango_layout_set_font_description(layout, font_desc);
+    pango_layout_set_text(layout, text.c_str(), text.size());
+
+    // Reserve equal space on each side so the title stays visually centered.
+    int left_padding = (button_area_width > 0) ? button_area_width : 10;
+    int right_padding = left_padding;  // Mirror for true visual centering
+    int text_width = width - left_padding - right_padding;
+    if (text_width < 0) text_width = width;  // Fallback if window too narrow
+    int text_x = left_padding;
+
+    // Center the text horizontally within the available space
+    pango_layout_set_alignment(layout, PANGO_ALIGN_CENTER);
+    pango_layout_set_width(layout, text_width * PANGO_SCALE);
+
+    // Prevent wrapping and add ellipsis for long titles
+    pango_layout_set_ellipsize(layout, PANGO_ELLIPSIZE_END);
+    pango_layout_set_single_paragraph_mode(layout, TRUE);
+
+    // Center vertically
+    PangoRectangle ink_rect, logical_rect;
+    pango_layout_get_pixel_extents(layout, &ink_rect, &logical_rect);
+    int text_y = (height - logical_rect.height) / 2 - logical_rect.y;
+
+    cairo_move_to(cr, text_x, text_y);
+    cairo_set_source_rgba(cr, color.r, color.g, color.b, color.a);
+    pango_cairo_show_layout(cr, layout);
+
+    pango_font_description_free(font_desc);
+    g_object_unref(layout);
+    cairo_destroy(cr);
+
+    return surface;
+}
+
+cairo_surface_t*decoration_theme_t::get_button_surface(button_type_t button,
+    const button_state_t& state) const
+{
+    // Lazy initialization: load GTK theme on first render
+    load_gtk_theme();
+
+    /* Pixmap style: if the GTK theme ships metacity-1 titlebuttons, the asset
+     * is the complete button - background, colour and glyph - so it replaces
+     * the drawn circle and symbolic icon entirely. */
+    const std::string style = button_style;
+    if (!panel_palette_loaded && style != "gtk" && style != "traffic")
+    {
+        const std::string asset = find_titlebutton_file(button, state);
+        if (!asset.empty())
+        {
+            cairo_surface_t *src = get_titlebutton_asset(asset, static_cast<int>(state.width));
+            if (src)
+            {
+                cairo_surface_t *out = cairo_image_surface_create(
+                    CAIRO_FORMAT_ARGB32, state.width, state.height);
+                cairo_t *out_cr = cairo_create(out);
+                cairo_set_source_surface(out_cr, src, 0, 0);
+                cairo_paint(out_cr);
+                cairo_destroy(out_cr);
+                return out;
+            }
+        }
+    }
+
+    cairo_surface_t *button_surface = cairo_image_surface_create(
+        CAIRO_FORMAT_ARGB32, state.width, state.height);
+
+    auto cr = cairo_create(button_surface);
+    cairo_set_antialias(cr, CAIRO_ANTIALIAS_BEST);
+
+    /* Clear the button background */
+    cairo_set_operator(cr, CAIRO_OPERATOR_CLEAR);
+    cairo_set_source_rgba(cr, 0, 0, 0, 0);
+    cairo_rectangle(cr, 0, 0, state.width, state.height);
+    cairo_fill(cr);
+
+    cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
+
+    // Determine button background color based on hover/active state
+    wf::color_t bg_color = theme_button_bg;
+    if (state.hover_progress > 0)
+    {
+        // Hover state
+        bg_color = theme_button_hover_bg;
+    }
+    else if (state.hover_progress < 0)
+    {
+        // Active/pressed state
+        bg_color = theme_button_active_bg;
+    }
+
+    const bool hovered = state.hover_progress > 0;
+    const bool pressed = state.hover_progress < 0;
+    const bool traffic = style == "traffic";
+    bool show_icon     = panel_palette_loaded || state.activated || hovered;
+
+    if (traffic)
+    {
+        bg_color = button == BUTTON_CLOSE ? palette_error :
+            button == BUTTON_MINIMIZE ? palette_warning : palette_success;
+        const std::string override_color = button == BUTTON_CLOSE ?
+            std::string(button_close_color) : button == BUTTON_MINIMIZE ?
+            std::string(button_minimize_color) : std::string(button_maximize_color);
+        static const std::regex hex_color("#[0-9a-fA-F]{6}");
+        if (override_color != "auto" &&
+            std::regex_match(override_color, hex_color))
+        {
+            bg_color = parse_css_color(override_color);
+        }
+        if (!state.activated)
+        {
+            bg_color.a *= 0.72;
+        }
+        if (pressed)
+        {
+            bg_color.r *= 0.82;
+            bg_color.g *= 0.82;
+            bg_color.b *= 0.82;
+        }
+        show_icon = hovered || pressed;
+    }
+    else if (panel_palette_loaded)
+    {
+        // Match the panel's flat controls: quiet by default, accent/error on hover.
+        bg_color = state.activated ? theme_titlebar_bg_inactive : theme_titlebar_bg_active;
+        if (hovered || pressed)
+        {
+            bg_color = button == BUTTON_CLOSE ? palette_error : palette_accent;
+            if (pressed)
+            {
+                bg_color.a = 0.75;
+            }
+        }
+    }
+
+    /* A theme that colours its buttons individually decides each state,
+     * including whether the glyph shows at all. */
+    wf::color_t themed_icon_color{};
+    const auto themed = titlebutton_colors.find(button);
+    if (!traffic && themed != titlebutton_colors.end())
+    {
+        const auto& colors = themed->second;
+        bg_color = pressed ? colors.pressed_bg :
+            (state.activated ? colors.bg : colors.backdrop_bg);
+
+        themed_icon_color = !(hovered || pressed) ? colors.fg :
+            (state.activated ? colors.hover_fg : colors.backdrop_hover_fg);
+        show_icon = themed_icon_color.a > 0;
+    }
+
+    // Draw circular button background - GTK style
+    // Larger circle so there's visible padding between icon and circle edge
+    // Keep the coloured and regular buttons the same physical size.
+    double radius = (state.width / 2.0) - 2.5;
+    cairo_arc(cr, state.width / 2, state.height / 2, radius, 0, 2 * M_PI);
+    cairo_set_source_rgba(cr, bg_color.r, bg_color.g, bg_color.b, bg_color.a);
+    cairo_fill(cr);
+
+    // Draw icon when window is active or when button is hovered (like native GTK)
+    if (show_icon)
+    {
+        // Use theme text color for icon, with fallback
+        wf::color_t icon_color = theme_titlebar_fg_active;
+        if (icon_color.r == 0.0 && icon_color.g == 0.0 && icon_color.b == 0.0)
+        {
+            icon_color = font_color;  // Fallback to config color
+        }
+
+        // Apply transparency based on hover state.
+        if (traffic)
+        {
+            // Compare contrast in linear light. A bright red can look dark to
+            // a channel-average threshold while still contrasting better with
+            // the dark glyph, unlike the yellow and green traffic lights.
+            auto linear = [] (double channel)
+            {
+                return channel <= 0.04045 ? channel / 12.92 :
+                    std::pow((channel + 0.055) / 1.055, 2.4);
+            };
+            const double luminance = 0.2126 * linear(bg_color.r) +
+                0.7152 * linear(bg_color.g) + 0.0722 * linear(bg_color.b);
+            const double dark_luminance = linear(0.1);
+            const double light_luminance = linear(0.96);
+            const double dark_contrast = (luminance + 0.05) / (dark_luminance + 0.05);
+            const double light_contrast = (light_luminance + 0.05) / (luminance + 0.05);
+            icon_color = dark_contrast >= light_contrast ?
+                wf::color_t{0.1, 0.1, 0.1, 1.0} : wf::color_t{0.96, 0.96, 0.96, 1.0};
+            icon_color.a = std::min(1.0, std::abs(state.hover_progress));
+        }
+        else if (panel_palette_loaded)
+        {
+            icon_color = hovered || pressed ? palette_accent_text : theme_titlebar_fg_active;
+            if (!state.activated && !hovered)
+            {
+                icon_color = palette_muted;
+            }
+        }
+        else if (state.hover_progress > 0)
+        {
+            // Hovered: full opacity white
+            icon_color.r = icon_color.g = icon_color.b = 1.0;
+            icon_color.a = 1.0;
+        }
+        else
+        {
+            // Default: semi-transparent
+            icon_color.a = 0.7;
+        }
+
+        if (!traffic && themed != titlebutton_colors.end())
+        {
+            icon_color = themed_icon_color;
+        }
+
+        // Try to load icon from theme
+        std::string icon_name;
+        switch (button)
+        {
+          case BUTTON_CLOSE:
+            icon_name = "window-close-symbolic";
+            break;
+          case BUTTON_TOGGLE_MAXIMIZE:
+            icon_name = "window-maximize-symbolic";
+            break;
+          case BUTTON_MINIMIZE:
+            icon_name = "window-minimize-symbolic";
+            break;
+          default:
+            break;
+        }
+
+        std::string icon_path;
+        if (panel_palette_loaded || traffic)
+        {
+            const std::string config = panel_config_home();
+            const char *tabler_name = button == BUTTON_CLOSE ? "x.svg" :
+                button == BUTTON_MINIMIZE ? "minus.svg" : "square.svg";
+            icon_path = config + "/quickshell/icons/tabler/" + tabler_name;
+            struct stat icon_stat;
+            if (stat(icon_path.c_str(), &icon_stat) != 0 || !S_ISREG(icon_stat.st_mode))
+            {
+                icon_path = std::string(PANEL_DECOR_TABLER_DIR) + "/" + tabler_name;
+            }
+        }
+        else
+        {
+            icon_path = find_icon_file(icon_name, static_cast<int>(state.width));
+        }
+        bool icon_loaded = false;
+
+#ifdef HAVE_LIBRSVG
+        if (!icon_path.empty() && icon_path.find(".svg") != std::string::npos)
+        {
+            GError *error = NULL;
+            RsvgHandle *handle = rsvg_handle_new_from_file(icon_path.c_str(), &error);
+
+            if (handle)
+            {
+                // Create temporary surface for the SVG
+                cairo_surface_t *icon_surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32,
+                    state.width, state.height);
+                cairo_t *icon_cr = cairo_create(icon_surface);
+
+                // Render SVG with padding inside the button circle
+                double icon_size = state.width * (panel_palette_loaded ? 0.65 : 0.85);
+                double offset = (state.width - icon_size) / 2.0;
+                RsvgRectangle viewport = {
+                    .x = offset,
+                    .y = offset,
+                    .width = icon_size,
+                    .height = icon_size
+                };
+
+                // Render SVG to temporary surface
+                if (rsvg_handle_render_document(handle, icon_cr, &viewport, &error))
+                {
+                    // Use the SVG as a mask and paint with the icon color
+                    cairo_set_source_rgba(cr, icon_color.r, icon_color.g, icon_color.b, icon_color.a);
+                    cairo_mask_surface(cr, icon_surface, 0, 0);
+                    icon_loaded = true;
+                }
+
+                cairo_destroy(icon_cr);
+                cairo_surface_destroy(icon_surface);
+                g_object_unref(handle);
+            }
+
+            if (error)
+            {
+                g_error_free(error);
+            }
+        }
+#endif
+
+        // Fallback to drawing icons if loading failed
+        // cppcheck-suppress knownConditionTrueFalse
+        if (!icon_loaded)
+        {
+            cairo_set_line_width(cr, 1.0 * state.border);
+            cairo_set_source_rgba(cr, icon_color.r, icon_color.g, icon_color.b, icon_color.a);
+            cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
+
+            switch (button)
+            {
+              case BUTTON_CLOSE:
+                // X icon - much smaller with substantial padding like GTK
+                cairo_move_to(cr, state.width * 0.49, state.height * 0.49);
+                cairo_line_to(cr, state.width * 0.51, state.height * 0.51);
+                cairo_move_to(cr, state.width * 0.51, state.height * 0.49);
+                cairo_line_to(cr, state.width * 0.49, state.height * 0.51);
+                cairo_stroke(cr);
+                break;
+
+              case BUTTON_TOGGLE_MAXIMIZE:
+                // Square icon - much smaller with substantial padding like GTK
+                {
+                    double size = state.width * 0.035;
+                    double x = (state.width - size) / 2.0;
+                    double y = (state.height - size) / 2.0;
+                    cairo_rectangle(cr, x, y, size, size);
+                    cairo_stroke(cr);
+                }
+                break;
+
+              case BUTTON_MINIMIZE:
+                // Minus icon - much smaller with substantial padding like GTK
+                cairo_move_to(cr, state.width * 0.49, state.height * 0.5);
+                cairo_line_to(cr, state.width * 0.51, state.height * 0.5);
+                cairo_stroke(cr);
+                break;
+
+              default:
+                assert(false);
+            }
+        }
+    } // end if (state.activated)
+
+    cairo_destroy(cr);
+    return button_surface;
+}
+}
+}

@@ -1,0 +1,3 @@
+Tabler Icons: https://github.com/tabler/tabler-icons
+Revision: 4581ad20d8d13e24f6c3be75caaea1c4ad6c4b35
+Outline SVGs recolored to #e6e8ec for the dark panel.

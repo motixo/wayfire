@@ -1,0 +1,386 @@
+#include <wayfire/per-output-plugin.hpp>
+#include <wayfire/view.hpp>
+#include <wayfire/workarea.hpp>
+#include <wayfire/matcher.hpp>
+#include <wayfire/workspace-set.hpp>
+#include <wayfire/output.hpp>
+#include <wayfire/signal-definitions.hpp>
+#include <wayfire/txn/transaction-manager.hpp>
+
+#include "deco-subsurface.hpp"
+#include "wayfire/core.hpp"
+#include "wayfire/plugin.hpp"
+#include "wayfire/signal-provider.hpp"
+#include "wayfire/toplevel-view.hpp"
+#include "wayfire/toplevel.hpp"
+
+#include <sys/inotify.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <cstring>
+
+class wayfire_gtkdecor : public wf::plugin_interface_t
+{
+    wf::view_matcher_t ignore_views{"panel-decor/ignore_views"};
+    wf::view_matcher_t forced_views{"panel-decor/forced_views"};
+
+    // Config options for live reload
+    wf::option_wrapper_t<int> title_height{"panel-decor/title_height"};
+    wf::option_wrapper_t<int> button_size{"panel-decor/button_size"};
+    wf::option_wrapper_t<int> title_font_size{"panel-decor/title_font_size"};
+    wf::option_wrapper_t<int> border_size{"panel-decor/border_size"};
+    wf::option_wrapper_t<int> corner_radius{"panel-decor/corner_radius"};
+    wf::option_wrapper_t<std::string> button_order{"panel-decor/button_order"};
+    wf::option_wrapper_t<std::string> button_style{"panel-decor/button_style"};
+    wf::option_wrapper_t<std::string> button_close_color{"panel-decor/button_close_color"};
+    wf::option_wrapper_t<std::string> button_minimize_color{"panel-decor/button_minimize_color"};
+    wf::option_wrapper_t<std::string> button_maximize_color{"panel-decor/button_maximize_color"};
+
+    // GTK settings file monitoring
+    int inotify_fd = -1;
+    int watch_fd = -1;
+    int palette_watch_fd = -1;
+    int icon_watch_fd = -1;
+    wl_event_source *inotify_source = nullptr;
+
+    wf::signal::connection_t<wf::txn::new_transaction_signal> on_new_tx =
+        [=] (wf::txn::new_transaction_signal *ev)
+    {
+        // For each transaction, we need to consider what happens with participating views
+        for (const auto& obj : ev->tx->get_objects())
+        {
+            if (auto toplevel = std::dynamic_pointer_cast<wf::toplevel_t>(obj))
+            {
+                // First check whether the toplevel already has decoration
+                // In that case, we should just set the correct margins
+                if (auto deco = toplevel->get_data<wf::simple_decorator_t>())
+                {
+                    toplevel->pending().margins = deco->get_margins(toplevel->pending());
+                    continue;
+                }
+
+                // Second case: the view is already mapped, or the transaction does not map it.
+                // The view is not being decorated, so nothing to do here.
+                if (toplevel->current().mapped || !toplevel->pending().mapped)
+                {
+                    continue;
+                }
+
+                // Third case: the transaction will map the toplevel.
+                auto view = wf::find_view_for_toplevel(toplevel);
+                wf::dassert(view != nullptr, "Mapping a toplevel means there must be a corresponding view!");
+                if (should_decorate_view(view))
+                {
+                    adjust_new_decorations(view);
+                }
+            }
+        }
+    };
+
+    wf::signal::connection_t<wf::view_decoration_state_updated_signal> on_decoration_state_changed =
+        [=] (wf::view_decoration_state_updated_signal *ev)
+    {
+        update_view_decoration(ev->view);
+    };
+
+    // allows criteria containing maximized or floating check
+    wf::signal::connection_t<wf::view_tiled_signal> on_view_tiled =
+        [=] (wf::view_tiled_signal *ev)
+    {
+        update_view_decoration(ev->view);
+    };
+
+    static int handle_inotify_event(int fd, uint32_t mask, void *data)
+    {
+        wayfire_gtkdecor *self = static_cast<wayfire_gtkdecor*>(data);
+
+        char buffer[4096]
+            __attribute__((aligned(__alignof__(struct inotify_event))));
+        ssize_t length = read(fd, buffer, sizeof(buffer)); // Flawfinder: ignore
+        if (length <= 0)
+        {
+            return 0;
+        }
+
+        // Parse inotify events
+        ssize_t i = 0;
+        while (i + static_cast<ssize_t>(sizeof(struct inotify_event)) <= length)
+        {
+            struct inotify_event *event = (struct inotify_event*)&buffer[i];
+            ssize_t event_size = sizeof(struct inotify_event) + event->len;
+            if (i + event_size > length)
+            {
+                break;
+            }
+
+            const bool gtk_changed = event->wd == self->watch_fd &&
+                (event->mask & (IN_MODIFY | IN_CLOSE_WRITE));
+            const bool palette_changed = event->wd == self->palette_watch_fd &&
+                event->len && std::strcmp(event->name, "current.json") == 0 &&
+                (event->mask & (IN_CLOSE_WRITE | IN_MOVED_TO | IN_CREATE));
+            const bool icon_changed = event->wd == self->icon_watch_fd && event->len &&
+                (std::strcmp(event->name, "x.svg") == 0 ||
+                 std::strcmp(event->name, "minus.svg") == 0 ||
+                 std::strcmp(event->name, "square.svg") == 0) &&
+                (event->mask & (IN_CLOSE_WRITE | IN_MOVED_TO | IN_CREATE | IN_DELETE));
+            if (gtk_changed || palette_changed || icon_changed)
+            {
+                LOGI("Decoration theme changed, reloading decorations");
+                self->reload_all_decorations();
+            }
+            i += event_size;
+        }
+
+        return 0;
+    }
+
+    void setup_gtk_settings_monitor()
+    {
+        const char *home = getenv("HOME");
+        if (!home)
+        {
+            return;
+        }
+
+        std::string settings_path = std::string(home) + "/.config/gtk-3.0/settings.ini";
+
+        inotify_fd = inotify_init1(IN_NONBLOCK);
+        if (inotify_fd < 0)
+        {
+            LOGE("Failed to initialize inotify for GTK settings monitoring");
+            return;
+        }
+
+        watch_fd = inotify_add_watch(inotify_fd, settings_path.c_str(), IN_MODIFY | IN_CLOSE_WRITE);
+        if (watch_fd < 0)
+        {
+            LOGE("Failed to watch GTK settings file: ", settings_path);
+        }
+
+        const char *xdg = getenv("XDG_CONFIG_HOME");
+        const std::string config_home = xdg && *xdg ? xdg : std::string(home) + "/.config";
+        const std::string palette_dir = config_home + "/desktop-settings/appearance/colors";
+        palette_watch_fd = inotify_add_watch(inotify_fd, palette_dir.c_str(),
+            IN_CLOSE_WRITE | IN_MOVED_TO | IN_CREATE);
+        if (palette_watch_fd < 0)
+        {
+            LOGE("Failed to watch palette directory: ", palette_dir);
+        }
+
+        const std::string icon_dir = config_home + "/quickshell/icons/tabler";
+        icon_watch_fd = inotify_add_watch(inotify_fd, icon_dir.c_str(),
+            IN_CLOSE_WRITE | IN_MOVED_TO | IN_CREATE | IN_DELETE);
+        if (icon_watch_fd < 0)
+        {
+            LOGE("Failed to watch Tabler icon directory: ", icon_dir);
+        }
+
+        if (watch_fd < 0 && palette_watch_fd < 0 && icon_watch_fd < 0)
+        {
+            close(inotify_fd);
+            inotify_fd = -1;
+            return;
+        }
+
+        auto display = wf::get_core().display;
+        auto event_loop = wl_display_get_event_loop(display);
+        inotify_source = wl_event_loop_add_fd(event_loop, inotify_fd, WL_EVENT_READABLE,
+                                              handle_inotify_event, this);
+
+        LOGI("Monitoring GTK settings file for theme changes: ", settings_path);
+    }
+
+    void cleanup_gtk_settings_monitor()
+    {
+        if (inotify_source)
+        {
+            wl_event_source_remove(inotify_source);
+            inotify_source = nullptr;
+        }
+
+        if (watch_fd >= 0)
+        {
+            inotify_rm_watch(inotify_fd, watch_fd);
+            watch_fd = -1;
+        }
+
+        if (palette_watch_fd >= 0)
+        {
+            inotify_rm_watch(inotify_fd, palette_watch_fd);
+            palette_watch_fd = -1;
+        }
+
+        if (icon_watch_fd >= 0)
+        {
+            inotify_rm_watch(inotify_fd, icon_watch_fd);
+            icon_watch_fd = -1;
+        }
+
+        if (inotify_fd >= 0)
+        {
+            close(inotify_fd);
+            inotify_fd = -1;
+        }
+    }
+
+    void reload_all_decorations()
+    {
+        for (auto& view : wf::get_core().get_all_views())
+        {
+            if (auto toplevel = wf::toplevel_cast(view))
+            {
+                if (auto deco = toplevel->toplevel()->get_data<wf::simple_decorator_t>())
+                {
+                    deco->reload_theme();
+                    view->damage();
+                }
+            }
+        }
+    }
+
+    // Callback for config option changes
+    wf::config::option_base_t::updated_callback_t on_config_changed = [=] ()
+    {
+        LOGI("GTK decoration config changed, reloading decorations");
+        reload_all_decorations();
+    };
+
+  public:
+    void init() override
+    {
+        LOGE("=== DECORATION PLUGIN INIT() CALLED ===");
+        wf::get_core().connect(&on_decoration_state_changed);
+        wf::get_core().tx_manager->connect(&on_new_tx);
+        wf::get_core().connect(&on_view_tiled);
+
+        // Setup config change callbacks for live reload
+        title_height.set_callback(on_config_changed);
+        button_size.set_callback(on_config_changed);
+        title_font_size.set_callback(on_config_changed);
+        border_size.set_callback(on_config_changed);
+        corner_radius.set_callback(on_config_changed);
+        button_order.set_callback(on_config_changed);
+        button_style.set_callback(on_config_changed);
+        button_close_color.set_callback(on_config_changed);
+        button_minimize_color.set_callback(on_config_changed);
+        button_maximize_color.set_callback(on_config_changed);
+
+        for (auto& view : wf::get_core().get_all_views())
+        {
+            update_view_decoration(view);
+        }
+
+        setup_gtk_settings_monitor();
+    }
+
+    void fini() override
+    {
+        cleanup_gtk_settings_monitor();
+
+        for (auto view : wf::get_core().get_all_views())
+        {
+            if (auto toplevel = wf::toplevel_cast(view))
+            {
+                remove_decoration(toplevel);
+                wf::get_core().tx_manager->schedule_object(toplevel->toplevel());
+            }
+        }
+    }
+
+    /**
+     * Uses view_matcher_t to match whether the given view needs to be
+     * ignored for decoration
+     *
+     * @param view The view to match
+     * @return Whether the given view should be decorated?
+     */
+    bool ignore_decoration_of_view(wayfire_view view)
+    {
+        return ignore_views.matches(view);
+    }
+
+    /**
+     * Uses view_matcher_t to match whether to force decorations onto the
+     * given view
+     *
+     * @param view The view to match
+     * @return Whether the given view should be decorated?
+     */
+    bool force_decoration_of_view(wayfire_view view)
+    {
+        return forced_views.matches(view);
+    }
+
+    bool should_decorate_view(wayfire_toplevel_view view)
+    {
+        return !ignore_decoration_of_view(view) &&
+               (force_decoration_of_view(view) || view->should_be_decorated());
+    }
+
+    void adjust_new_decorations(wayfire_toplevel_view view)
+    {
+        LOGI("Adding decoration to view: ", view->get_title());
+        auto toplevel = view->toplevel();
+
+        toplevel->store_data(std::make_unique<wf::simple_decorator_t>(view));
+        auto deco     = toplevel->get_data<wf::simple_decorator_t>();
+        auto& pending = toplevel->pending();
+        pending.margins = deco->get_margins(pending);
+
+        if (!pending.fullscreen && !pending.tiled_edges)
+        {
+            pending.geometry = wf::expand_geometry_by_margins(pending.geometry, pending.margins);
+            if (view->get_output())
+            {
+                pending.geometry = wf::clamp(pending.geometry, view->get_output()->workarea->get_workarea());
+            }
+        }
+    }
+
+    void remove_decoration(wayfire_toplevel_view view)
+    {
+        view->toplevel()->erase_data<wf::simple_decorator_t>();
+        auto& pending = view->toplevel()->pending();
+        if (!pending.fullscreen && !pending.tiled_edges)
+        {
+            pending.geometry = wf::shrink_geometry_by_margins(pending.geometry, pending.margins);
+        }
+
+        pending.margins = {0, 0, 0, 0};
+    }
+
+    bool is_toplevel_decorated(const std::shared_ptr<wf::toplevel_t>& toplevel)
+    {
+        return toplevel->has_data<wf::simple_decorator_t>();
+    }
+
+    void update_view_decoration(wayfire_view view)
+    {
+        if (auto toplevel = wf::toplevel_cast(view))
+        {
+            const bool wants_decoration = should_decorate_view(toplevel);
+            if (wants_decoration != is_toplevel_decorated(toplevel->toplevel()))
+            {
+                if (wants_decoration)
+                {
+                    adjust_new_decorations(toplevel);
+                } else
+                {
+                    remove_decoration(toplevel);
+                }
+
+                wf::get_core().tx_manager->schedule_object(toplevel->toplevel());
+            }
+        }
+    }
+};
+
+extern "C" __attribute__((visibility("default"))) wf::plugin_interface_t*newInstance()
+{
+    return new wayfire_gtkdecor;
+}
+
+extern "C" __attribute__((visibility("default"))) uint32_t getWayfireVersion()
+{
+    return WAYFIRE_API_ABI_VERSION;
+}
