@@ -7,6 +7,7 @@
 #include "wayfire/scene-operations.hpp"
 #include <wayfire/workarea.hpp>
 #include <wayfire/window-manager.hpp>
+#include <algorithm>
 
 struct autocommit_transaction_t
 {
@@ -50,6 +51,7 @@ class tile_workspace_set_data_t : public wf::custom_data_t
     wf::option_wrapper_t<int> inner_gaps{"simple-tile/inner_gap_size"};
     wf::option_wrapper_t<int> outer_horiz_gaps{"simple-tile/outer_horiz_gap_size"};
     wf::option_wrapper_t<int> outer_vert_gaps{"simple-tile/outer_vert_gap_size"};
+    wf::option_wrapper_t<std::string> layout_mode{"simple-tile/layout_mode"};
 
     tile_workspace_set_data_t(std::shared_ptr<wf::workspace_set_t> wset)
     {
@@ -264,7 +266,63 @@ class tile_workspace_set_data_t : public wf::custom_data_t
         auto view_node = setup_view_tiling(view, vp);
         {
             autocommit_transaction_t tx;
-            roots[vp.x][vp.y]->as_split_node()->add_child(std::move(view_node), tx.tx);
+            auto& root = roots[vp.x][vp.y];
+            auto root_split = root->as_split_node();
+            if ((std::string(layout_mode) == "dwindle") &&
+                (root_split->children.size() < 2) &&
+                (root_split->get_split_direction() != tile::SPLIT_VERTICAL))
+            {
+                // Dragging may change the root axis. Start a new one- or
+                // two-window layout with the usual left/right split.
+                auto previous_root = std::move(root);
+                auto vertical_root = std::make_unique<tile::split_node_t>(tile::SPLIT_VERTICAL);
+                vertical_root->geometry = previous_root->geometry;
+                if (!previous_root->children.empty())
+                {
+                    auto child = std::move(previous_root->children.front());
+                    child->parent = {vertical_root.get()};
+                    vertical_root->children.push_back(std::move(child));
+                }
+
+                root = std::move(vertical_root);
+                root_split = root->as_split_node();
+                root->set_gaps(get_gaps());
+            }
+            if ((std::string(layout_mode) != "dwindle") || (root_split->children.size() < 2))
+            {
+                root_split->add_child(std::move(view_node), tx.tx);
+            } else
+            {
+                // Split the last tile instead of appending another root column.
+                // Alternating the axis produces the familiar binary layout.
+                auto target = root_split->children.back().get();
+                while (target->as_split_node())
+                {
+                    target = target->children.back().get();
+                }
+
+                auto parent = target->parent;
+                auto direction = parent->get_split_direction() == tile::SPLIT_VERTICAL ?
+                    tile::SPLIT_HORIZONTAL : tile::SPLIT_VERTICAL;
+                auto split = std::make_unique<tile::split_node_t>(direction);
+                split->parent = parent;
+                split->geometry = target->geometry;
+
+                auto& siblings = parent->children;
+                auto position = std::find_if(siblings.begin(), siblings.end(),
+                    [target] (const auto& child) { return child.get() == target; });
+                auto previous = std::move(*position);
+                previous->parent = {split.get()};
+                view_node->parent = {split.get()};
+                previous->geometry = target->geometry;
+                view_node->geometry = target->geometry;
+                split->children.push_back(std::move(previous));
+                split->children.push_back(std::move(view_node));
+                *position = std::move(split);
+
+                root->set_gaps(get_gaps());
+                root->set_geometry(root->geometry, tx.tx);
+            }
         }
 
         consider_exit_fullscreen(view);

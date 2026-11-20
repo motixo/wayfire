@@ -42,17 +42,23 @@ class crossfade_node_t : public scene::view_2d_transformer_t
   public:
     wf::geometry_t displayed_geometry;
     double overlay_alpha;
+    bool has_original_contents = false;
 
-    crossfade_node_t(wayfire_toplevel_view view) : view_2d_transformer_t(view)
+    crossfade_node_t(wayfire_toplevel_view view, bool capture_contents) : view_2d_transformer_t(view)
     {
         this->view = view;
-        capture_current_contents();
+        capture_current_contents(capture_contents);
     }
 
-    void capture_current_contents()
+    void capture_current_contents(bool capture_contents)
     {
         displayed_geometry = view->get_geometry();
         overlay_alpha = 0.0;
+        has_original_contents = capture_contents;
+        if (!capture_contents)
+        {
+            return;
+        }
 
         auto root_node = view->get_surface_root_node();
         const wf::geometry_t bbox = root_node->get_bounding_box();
@@ -178,14 +184,29 @@ class crossfade_render_instance_t : public scene::render_instance_t
 
     void render(const wf::scene::render_instruction_t& data) override
     {
+        if (!self->has_original_contents)
+        {
+            return;
+        }
+
         double ra;
         const double N = 2;
-        if (self->overlay_alpha < 0.5)
+        const auto current = self->view->get_geometry();
+        const auto displayed = self->displayed_geometry;
+        if (current.width * current.height > displayed.width * displayed.height + 1.0)
+        {
+            ra = 1.0;
+        } else if (self->overlay_alpha < 0.5)
         {
             ra = std::pow(self->overlay_alpha * 2, 1.0 / N) / 2.0;
         } else
         {
             ra = std::pow((self->overlay_alpha - 0.5) * 2, N) / 2.0 + 0.5;
+        }
+
+        if (ra >= 1.0)
+        {
+            return;
         }
 
         auto tex = wf::texture_t::from_buffer(
@@ -249,6 +270,13 @@ class grid_animation_t : public wf::custom_data_t
      */
     void adjust_target_geometry(wf::geometry_t geometry, int32_t target_edges, wf::txn::transaction_uptr& tx)
     {
+        if (target_edges >= 0 && output && output->handle->scale > 0)
+        {
+            const double scale = output->handle->scale;
+            geometry.x = std::round(geometry.x * scale) / scale;
+            geometry.y = std::round(geometry.y * scale) / scale;
+        }
+
         const auto serial = ++animation_serial;
 
         // Apply the desired attributes to the view
@@ -333,6 +361,10 @@ class grid_animation_t : public wf::custom_data_t
     ~grid_animation_t()
     {
         view->get_transformed_node()->rem_transformer<crossfade_node_t>();
+        if (redraw_always)
+        {
+            output->render->set_redraw_always(false);
+        }
         output->render->rem_effect(&pre_hook);
     }
 
@@ -365,6 +397,7 @@ class grid_animation_t : public wf::custom_data_t
         tr->displayed_geometry = animation;
         tr->overlay_alpha = animation.progress();
         view->get_transformed_node()->end_transform_update();
+        scene::damage_node(tr, tr->get_bounding_box());
     };
 
     void destroy()
@@ -375,18 +408,26 @@ class grid_animation_t : public wf::custom_data_t
     void start_crossfade(wf::geometry_t start_geometry, wf::geometry_t target_geometry)
     {
         const auto current_displayed = animation.running() ? wf::geometry_t(animation) : start_geometry;
+        const bool capture_contents =
+            target_geometry.width * target_geometry.height <=
+            current_displayed.width * current_displayed.height;
         auto tr = view->get_transformed_node()->get_transformer<crossfade_node_t>();
         if (!tr)
         {
             view->get_transformed_node()->add_transformer(
-                std::make_shared<crossfade_node_t>(view),
+                std::make_shared<crossfade_node_t>(view, capture_contents),
                 wf::TRANSFORMER_2D);
         } else
         {
-            tr->capture_current_contents();
+            tr->capture_current_contents(capture_contents);
         }
 
         waiting_for_transaction = false;
+        if (!redraw_always)
+        {
+            output->render->set_redraw_always(true);
+            redraw_always = true;
+        }
         original = current_displayed;
         animation.set_start(current_displayed);
         animation.set_end(target_geometry);
@@ -406,6 +447,7 @@ class grid_animation_t : public wf::custom_data_t
 
     wf::geometry_animation_t animation;
     bool waiting_for_transaction = false;
+    bool redraw_always = false;
     uint64_t animation_serial = 0;
     type_t type;
 };

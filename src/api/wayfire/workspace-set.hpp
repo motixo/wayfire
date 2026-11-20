@@ -150,11 +150,15 @@ class workspace_set_t : public wf::signal::provider_t, public wf::object_base_t,
 
     /**
      * Get the main workspace for a view.
-     * The main workspace is the one which contains the view's center.
+     * The main workspace is the one which contains the view's center, or its assigned workspace when
+     * core/isolate_workspaces is enabled.
      *
      * If the center is on an invalid workspace, the closest workspace will be returned.
      */
     wf::point_t get_view_main_workspace(wayfire_toplevel_view view);
+
+    /** The workspace assigned to a view, independent of any content extending past its edge. */
+    wf::point_t get_view_home_workspace(wayfire_toplevel_view view);
 
     /**
      * Check if the given view is visible on the given workspace

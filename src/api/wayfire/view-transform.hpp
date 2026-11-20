@@ -7,6 +7,7 @@
 #include "wayfire/scene-render.hpp"
 #include "wayfire/scene.hpp"
 #include <memory>
+#include <cmath>
 #include <wayfire/render.hpp>
 
 namespace wf
@@ -137,14 +138,16 @@ class transformer_render_instance_t : public render_instance_t
             return tex;
         }
 
-        auto contents =
-            self->get_updated_contents(self->get_children_bounding_box(), scale, children, _shown_on);
+        auto bbox = self->get_children_bounding_box();
+        auto contents = self->get_updated_contents(bbox, scale, children, _shown_on);
         if (out_logical_size)
         {
-            *out_logical_size = wf::dimensionsf_t{
-                self->inner_content.get_size().width / scale,
-                self->inner_content.get_size().height / scale
-            };
+            const auto requested = wf::dimensions(bbox);
+            const auto actual = self->inner_content.get_size();
+            const bool capped = (actual.width < std::ceil(requested.width * scale)) ||
+                (actual.height < std::ceil(requested.height * scale));
+            *out_logical_size = capped ? wf::fdimensions(bbox) : wf::dimensionsf_t{
+                actual.width / scale, actual.height / scale};
         }
 
         return contents;

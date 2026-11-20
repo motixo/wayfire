@@ -333,7 +333,7 @@ class rounded_transformer_t : public wf::scene::view_2d_transformer_t,
             // The child pass can disable blending when it draws opaque
             // surfaces. Enter the GLES subpass after it finishes so the
             // rounded mask is composited over the background.
-            auto contents = get_texture(1.0);
+            auto contents = get_texture(data.target.scale);
             data.pass->custom_gles_subpass([&]
             {
                 auto texture = wf::gles_texture_t{contents};

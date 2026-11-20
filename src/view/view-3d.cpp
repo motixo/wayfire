@@ -629,7 +629,13 @@ std::shared_ptr<wf::texture_t> transformer_base_node_t::get_updated_contents(con
     }
 
     wf::render_target_t target{inner_content};
-    target.scale    = scale;
+    const auto requested = wf::dimensions(bbox);
+    const auto actual = inner_content.get_size();
+    const bool capped = (actual.width < std::ceil(requested.width * scale)) ||
+        (actual.height < std::ceil(requested.height * scale));
+    target.scale = capped ? std::min(
+        actual.width / std::max(1.0, bbox.width),
+        actual.height / std::max(1.0, bbox.height)) : scale;
     target.geometry = bbox;
 
     render_pass_params_t params;

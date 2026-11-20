@@ -4,6 +4,7 @@
 #include <wayfire/opengl.hpp>
 #include <wayfire/render-manager.hpp>
 #include <wayfire/region.hpp>
+#include <list>
 
 /* The MIT License (MIT)
  *
@@ -94,7 +95,10 @@ class wf_blur_base
     /* used to store temporary results in blur algorithms, cleaned up in base
      * destructor */
     wf::auxilliary_buffer_t fb[2];
+    std::list<wf::auxilliary_buffer_t> cached_buffers;
     wf::geometry_t prepared_geometry;
+
+    void allocate_blur_buffer(wf::auxilliary_buffer_t& buffer, wf::dimensions_t size);
 
     /* the program created by the given algorithm, cleaned up in base destructor */
     OpenGL::program_t program[2];

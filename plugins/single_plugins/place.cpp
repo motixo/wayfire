@@ -8,6 +8,7 @@
 #include <wayfire/workarea.hpp>
 #include <wayfire/window-manager.hpp>
 #include <wayfire/signal-definitions.hpp>
+#include <cmath>
 
 class wayfire_place_cascade_data : public wf::custom_data_t
 {
@@ -90,6 +91,14 @@ class wayfire_place_window : public wf::plugin_interface_t
         {
             center(view, workarea);
         }
+
+        if (mode != "maximize")
+        {
+            auto& geometry = view->toplevel()->pending().geometry;
+            const double scale = output->handle->scale;
+            geometry.x = std::round(geometry.x * scale) / scale;
+            geometry.y = std::round(geometry.y * scale) / scale;
+        }
     }
 
     void adjust_cascade_for_workarea(nonstd::observer_ptr<wayfire_place_cascade_data> cascade,
@@ -160,8 +169,8 @@ class wayfire_place_window : public wf::plugin_interface_t
     void center(wayfire_toplevel_view & view, wf::geometry_t workarea)
     {
         wf::geometry_t window = view->get_pending_geometry();
-        view->toplevel()->pending().geometry.x = workarea.x + (workarea.width / 2) - (window.width / 2);
-        view->toplevel()->pending().geometry.y = workarea.y + (workarea.height / 2) - (window.height / 2);
+        view->toplevel()->pending().geometry.x = workarea.x + (workarea.width - window.width) / 2;
+        view->toplevel()->pending().geometry.y = workarea.y + (workarea.height - window.height) / 2;
     }
 
     void pointer(wayfire_toplevel_view & view, wf::geometry_t workarea)

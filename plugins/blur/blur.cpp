@@ -47,9 +47,14 @@ class blur_node_t : public transformer_base_node_t
 {
   public:
     blur_algorithm_provider provider;
+    wf::option_wrapper_t<double> skip_small_translucency{"blur/skip_small_translucency"};
     blur_node_t(blur_algorithm_provider provider) : transformer_base_node_t(false)
     {
         this->provider = provider;
+        skip_small_translucency.set_callback([this]
+        {
+            wf::scene::damage_node(this, get_bounding_box());
+        });
     }
 
     std::string stringify() const override
@@ -62,7 +67,15 @@ class blur_node_t : public transformer_base_node_t
 
     struct saved_pixels_t
     {
+        struct tile_t
+        {
+            wf::auxilliary_buffer_t pixels;
+            wlr_box box{};
+        };
+
         wf::auxilliary_buffer_t pixels;
+        std::vector<tile_t> tiles;
+        size_t tile_count = 0;
         wf::region_t region;
         bool taken = false;
     };
@@ -102,7 +115,36 @@ class blur_render_instance_t : public transformer_render_instance_t<blur_node_t>
         {
             if (auto opaque = dynamic_cast<opaque_region_node_t*>(self->get_children().front().get()))
             {
-                return (damage ^ opaque->get_opaque_region()).empty();
+                auto opaque_region = opaque->get_opaque_region();
+                if ((damage ^ opaque_region).empty())
+                {
+                    return true;
+                }
+
+                // Decide from the whole visible node, not this frame's damage.
+                // Otherwise a corner-only repaint could alternate between blurred
+                // and unblurred output as the damage region changes.
+                if (self->skip_small_translucency <= 0.0)
+                {
+                    return false;
+                }
+
+                const wf::regionf_t visible{self->get_bounding_box()};
+                const auto translucent = visible ^ opaque_region;
+                auto area = [] (const wf::regionf_t& region)
+                {
+                    double result = 0;
+                    for (const auto& box : region)
+                    {
+                        result += (box.x2 - box.x1) * (box.y2 - box.y1);
+                    }
+
+                    return result;
+                };
+
+                const double visible_area = area(visible);
+                return visible_area > 0 &&
+                    area(translucent) <= visible_area * double(self->skip_small_translucency);
             }
         }
 
@@ -131,8 +173,14 @@ class blur_render_instance_t : public transformer_render_instance_t<blur_node_t>
     void schedule_instructions(std::vector<render_instruction_t>& instructions,
         const wf::render_target_t& target, wf::regionf_t& damage) override
     {
-        const int padding = calculate_damage_padding(target, self->provider()->calculate_blur_radius());
         auto bbox = self->get_bounding_box();
+        auto padded_region = damage & bbox & target.geometry;
+        if (padded_region.empty())
+        {
+            return;
+        }
+
+        const int padding = calculate_damage_padding(target, self->provider()->calculate_blur_radius());
 
         // In order to render a part of the blurred background, we need to sample
         // from area which is larger than the damaged area. However, the edges
@@ -142,8 +190,6 @@ class blur_render_instance_t : public transformer_render_instance_t<blur_node_t>
         // have redrawn if not for blur. After that, we copy those old areas
         // back to the destination framebuffer, giving the illusion that they
         // were never damaged.
-        auto padded_region = damage & bbox;
-
         if (is_fully_opaque(padded_region & target.geometry) && target.is_integer_scale())
         {
             // If there are no regions to blur, we can directly render them.
@@ -174,30 +220,76 @@ class blur_render_instance_t : public transformer_render_instance_t<blur_node_t>
         saved_pixels->region =
             target.framebuffer_region_from_geometry_region(padded_region) ^
             target.framebuffer_region_from_geometry_region(damage);
+        saved_pixels->tile_count = 0;
 
         // Nodes below should re-render the padded areas so that we can sample from them
         damage |= padded_region;
 
-        saved_pixels->pixels.allocate(target.get_size());
-
-        wf::gles::run_in_context_if_gles([&]
+        // When damage already covers the blur padding, there are no old pixels to preserve.
+        if (!saved_pixels->region.empty())
         {
-            GLuint target_fb = wf::gles::ensure_render_buffer_fb_id(target);
+            static wf::option_wrapper_t<int> max_buffer_size{"workarounds/max_buffer_size"};
+            const int tile_limit = std::max(1, (int)max_buffer_size);
+            const auto target_size = target.get_size();
+            const bool needs_tiles = (target_size.width > tile_limit) ||
+                (target_size.height > tile_limit);
 
-            wf::gles::bind_render_buffer(saved_pixels->pixels.get_renderbuffer());
-            GL_CALL(glBindFramebuffer(GL_READ_FRAMEBUFFER, target_fb));
-
-            /* Copy pixels in padded_region from target_fb to saved_pixels. */
-            for (const auto& box : saved_pixels->region)
+            if (needs_tiles)
             {
-                GL_CALL(glBlitFramebuffer(
-                    box.x1, box.y1,
-                    box.x2, box.y2,
-                    box.x1, box.y1,
-                    box.x2, box.y2,
-                    GL_COLOR_BUFFER_BIT, GL_LINEAR));
+                saved_pixels->pixels.free();
+            } else
+            {
+                saved_pixels->tiles.clear();
+                saved_pixels->pixels.allocate(target_size);
             }
-        });
+
+            wf::gles::run_in_context_if_gles([&]
+            {
+                GLuint target_fb = wf::gles::ensure_render_buffer_fb_id(target);
+                if (needs_tiles)
+                {
+                    for (const auto& rect : saved_pixels->region)
+                    {
+                        for (int y = rect.y1; y < rect.y2; y += tile_limit)
+                        {
+                            for (int x = rect.x1; x < rect.x2; x += tile_limit)
+                            {
+                                if (saved_pixels->tile_count == saved_pixels->tiles.size())
+                                {
+                                    saved_pixels->tiles.emplace_back();
+                                }
+
+                                auto& tile = saved_pixels->tiles[saved_pixels->tile_count++];
+                                tile.box = {x, y, std::min(tile_limit, rect.x2 - x),
+                                    std::min(tile_limit, rect.y2 - y)};
+                                tile.pixels.allocate({tile.box.width, tile.box.height});
+                                wf::gles::bind_render_buffer(tile.pixels.get_renderbuffer());
+                                GL_CALL(glBindFramebuffer(GL_READ_FRAMEBUFFER, target_fb));
+                                GL_CALL(glBlitFramebuffer(
+                                    x, y, x + tile.box.width, y + tile.box.height,
+                                    0, 0, tile.box.width, tile.box.height,
+                                    GL_COLOR_BUFFER_BIT, GL_NEAREST));
+                            }
+                        }
+                    }
+                } else
+                {
+                    wf::gles::bind_render_buffer(saved_pixels->pixels.get_renderbuffer());
+                    GL_CALL(glBindFramebuffer(GL_READ_FRAMEBUFFER, target_fb));
+
+                    /* Copy pixels in padded_region from target_fb to saved_pixels. */
+                    for (const auto& box : saved_pixels->region)
+                    {
+                        GL_CALL(glBlitFramebuffer(
+                            box.x1, box.y1,
+                            box.x2, box.y2,
+                            box.x1, box.y1,
+                            box.x2, box.y2,
+                            GL_COLOR_BUFFER_BIT, GL_LINEAR));
+                    }
+                }
+            });
+        }
 
         instructions.push_back(render_instruction_t{
                     .instance = this,
@@ -227,23 +319,41 @@ class blur_render_instance_t : public transformer_render_instance_t<blur_node_t>
 
             GL_CALL(glDisable(GL_SCISSOR_TEST));
 
-            GLuint saved_fb = wf::gles::ensure_render_buffer_fb_id(saved_pixels->pixels.get_renderbuffer());
-            wf::gles::bind_render_buffer(data.target);
-            // Setup framebuffer I/O. target_fb contains the frame
-            // rendered with expanded damage and artifacts on the edges.
-            // saved_pixels has the the padded region of pixels to overwrite the
-            // artifacts that blurring has left behind.
-            GL_CALL(glBindFramebuffer(GL_READ_FRAMEBUFFER, saved_fb));
-
-            /* Copy pixels back from saved_pixels to target_fb. */
-            for (const auto& box : saved_pixels->region)
+            if (!saved_pixels->region.empty())
             {
-                GL_CALL(glBlitFramebuffer(
-                    box.x1, box.y1,
-                    box.x2, box.y2,
-                    box.x1, box.y1,
-                    box.x2, box.y2,
-                    GL_COLOR_BUFFER_BIT, GL_LINEAR));
+                wf::gles::bind_render_buffer(data.target);
+                if (saved_pixels->tile_count > 0)
+                {
+                    for (size_t i = 0; i < saved_pixels->tile_count; i++)
+                    {
+                        auto& tile = saved_pixels->tiles[i];
+                        GLuint saved_fb = wf::gles::ensure_render_buffer_fb_id(
+                            tile.pixels.get_renderbuffer());
+                        GL_CALL(glBindFramebuffer(GL_READ_FRAMEBUFFER, saved_fb));
+                        GL_CALL(glBlitFramebuffer(
+                            0, 0, tile.box.width, tile.box.height,
+                            tile.box.x, tile.box.y,
+                            tile.box.x + tile.box.width, tile.box.y + tile.box.height,
+                            GL_COLOR_BUFFER_BIT, GL_NEAREST));
+                    }
+                } else
+                {
+                    GLuint saved_fb = wf::gles::ensure_render_buffer_fb_id(
+                        saved_pixels->pixels.get_renderbuffer());
+                    GL_CALL(glBindFramebuffer(GL_READ_FRAMEBUFFER, saved_fb));
+
+                    // Restore pixels outside the original damage after rendering
+                    // the padded region needed by the blur.
+                    for (const auto& box : saved_pixels->region)
+                    {
+                        GL_CALL(glBlitFramebuffer(
+                            box.x1, box.y1,
+                            box.x2, box.y2,
+                            box.x1, box.y1,
+                            box.x2, box.y2,
+                            GL_COLOR_BUFFER_BIT, GL_LINEAR));
+                    }
+                }
             }
 
             /* Reset stuff */
@@ -406,4 +516,12 @@ class wayfire_blur : public wf::plugin_interface_t
     }
 };
 
-DECLARE_WAYFIRE_PLUGIN(wayfire_blur);
+extern "C" __attribute__((visibility("default"))) wf::plugin_interface_t *newInstance()
+{
+    return new wayfire_blur;
+}
+
+extern "C" __attribute__((visibility("default"))) uint32_t getWayfireVersion()
+{
+    return WAYFIRE_API_ABI_VERSION;
+}

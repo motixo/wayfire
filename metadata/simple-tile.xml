@@ -9,6 +9,11 @@
 			<_long>Enables tiling for windows matching the specified criteria.</_long>
 			<default>all</default>
 		</option>
+		<option name="layout_mode" type="string">
+			<_short>Automatic tile layout</_short>
+			<_long>"columns" keeps the original Simple Tile insertion. "dwindle" splits the last tile in the alternate direction, so the third window shares the right half instead of creating a third column.</_long>
+			<default>columns</default>
+		</option>
 		<option name="keep_fullscreen_on_adjacent" type="bool">
 			<_short>Keep fullscreen on adjacent</_short>
 			<_long>Specifies whether to keep fullscreen state when changing the focus.	If **true**, the next focused window will also get fullscreen.	If **false**, leaves fullscreen.</_long>

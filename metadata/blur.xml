@@ -10,6 +10,13 @@
 			<_long>Criteria for which apps to be blurred when they are opened</_long>
 			<default>type is "toplevel"</default>
 		</option>
+		<option name="skip_small_translucency" type="double">
+			<_short>Skip blur for almost opaque areas</_short>
+			<_long>Skip backdrop blur when the translucent part is no larger than this fraction of the visible window area. Small transparent details such as rounded corners then show the unblurred background. Set to zero to preserve exact blur.</_long>
+			<default>0.0</default>
+			<min>0.0</min>
+			<max>0.25</max>
+		</option>
 		<!-- Key-bindings -->
 		<option name="toggle" type="button">
 			<_short>Toggle</_short>

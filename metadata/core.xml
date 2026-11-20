@@ -27,6 +27,11 @@
 			<default>3</default>
 			<min>1</min>
 		</option>
+		<option name="isolate_workspaces" type="bool">
+			<_short>Keep window content inside its workspace</_short>
+			<_long>Clip a window at its workspace boundary without changing its position or size.</_long>
+			<default>false</default>
+		</option>
 		<option name="background_color" type="color">
 			<_short>Background color</_short>
 			<_long>Sets the background color of workspaces.  Visible when nothing is drawing the background.</_long>

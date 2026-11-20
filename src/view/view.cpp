@@ -9,6 +9,9 @@
 #include "wayfire/scene.hpp"
 #include "wayfire/view.hpp"
 #include "wayfire/view-transform.hpp"
+#include "wayfire/toplevel-view.hpp"
+#include "wayfire/workspace-set.hpp"
+#include "wayfire/option-wrapper.hpp"
 
 #include <glm/glm.hpp>
 #include "wayfire/signal-definitions.hpp"
@@ -146,12 +149,176 @@ void wf::view_interface_t::set_surface_root_node(scene::floating_inner_ptr surfa
     priv->transformed_node->set_children_list({surface_root_node});
 }
 
+static std::optional<wf::geometry_t> get_workspace_clip(wf::view_interface_t *view)
+{
+    static wf::option_wrapper_t<bool> isolate_workspaces{"core/isolate_workspaces"};
+    if (!isolate_workspaces || !view || (view->role == wf::VIEW_ROLE_DESKTOP_ENVIRONMENT))
+    {
+        return {};
+    }
+
+    auto toplevel = wf::toplevel_cast(wayfire_view{view});
+    if (!toplevel || toplevel->sticky)
+    {
+        return {};
+    }
+
+    auto wset = toplevel->get_wset();
+    if (!wset || !wset->get_attached_output())
+    {
+        return {};
+    }
+
+    auto geometry = wset->get_last_output_geometry();
+    if (!geometry)
+    {
+        return {};
+    }
+
+    auto home = wset->get_view_home_workspace(toplevel);
+    auto current = wset->get_current_workspace();
+    geometry->x += (home.x - current.x) * geometry->width;
+    geometry->y += (home.y - current.y) * geometry->height;
+    return geometry;
+}
+
+class isolated_view_render_instance_t : public wf::scene::render_instance_t
+{
+    std::weak_ptr<wf::view_interface_t> view;
+    std::vector<wf::scene::render_instance_uptr> children;
+    wf::scene::damage_callback push_damage;
+
+    wf::signal::connection_t<wf::scene::node_damage_signal> on_node_damage =
+        [=] (wf::scene::node_damage_signal *ev)
+    {
+        push_damage(ev->region);
+    };
+
+    std::optional<wf::geometry_t> clip() const
+    {
+        auto ptr = view.lock();
+        return get_workspace_clip(ptr.get());
+    }
+
+  public:
+    isolated_view_render_instance_t(wf::view_interface_t *view, wf::scene::node_t *node,
+        wf::scene::damage_callback push_damage, wf::output_t *shown_on) :
+        view(view->weak_from_this()), push_damage(push_damage)
+    {
+        node->connect(&on_node_damage);
+        auto forward_damage = [=] (wf::regionf_t damage)
+        {
+            if (auto bounds = clip())
+            {
+                damage &= *bounds;
+            }
+
+            this->push_damage(damage);
+        };
+
+        for (auto& child : node->get_children())
+        {
+            if (child->is_enabled())
+            {
+                child->gen_render_instances(children, forward_damage, shown_on);
+            }
+        }
+    }
+
+    void schedule_instructions(std::vector<wf::scene::render_instruction_t>& instructions,
+        const wf::render_target_t& target, wf::regionf_t& damage) override
+    {
+        if (auto bounds = clip())
+        {
+            wf::regionf_t inside = damage & *bounds;
+            for (auto& child : children)
+            {
+                child->schedule_instructions(instructions, target, inside);
+            }
+
+            damage ^= *bounds;
+            damage |= inside & *bounds;
+        } else
+        {
+            for (auto& child : children)
+            {
+                child->schedule_instructions(instructions, target, damage);
+            }
+        }
+    }
+
+    wf::scene::direct_scanout try_scanout(wf::output_t *output) override
+    {
+        if (auto bounds = clip(); bounds && (*bounds != output->get_relative_geometry()))
+        {
+            return wf::scene::direct_scanout::OCCLUSION;
+        }
+
+        return wf::scene::try_scanout_from_list(children, output);
+    }
+
+    void compute_visibility(wf::output_t *output, wf::regionf_t& visible) override
+    {
+        if (auto bounds = clip())
+        {
+            auto inside = visible & *bounds;
+            wf::scene::compute_visibility_from_list(children, output, inside, {0, 0});
+            visible ^= *bounds;
+            visible |= inside & *bounds;
+        } else
+        {
+            wf::scene::compute_visibility_from_list(children, output, visible, {0, 0});
+        }
+    }
+
+    void presentation_feedback(wf::output_t *output) override
+    {
+        for (auto& child : children)
+        {
+            child->presentation_feedback(output);
+        }
+    }
+};
+
 class view_root_node_t : public wf::scene::floating_inner_node_t, public wf::view_node_tag_t
 {
   public:
     view_root_node_t(wf::view_interface_t *_view) : floating_inner_node_t(false),
         view_node_tag_t(_view), view(_view->weak_from_this())
     {}
+
+    std::optional<wf::scene::input_node_t> find_node_at(const wf::pointf_t& at) override
+    {
+        auto ptr = view.lock();
+        if (auto bounds = get_workspace_clip(ptr.get()); bounds && !(*bounds & at))
+        {
+            return {};
+        }
+
+        return floating_inner_node_t::find_node_at(at);
+    }
+
+    wf::keyboard_focus_node_t keyboard_refocus(wf::output_t *output) override
+    {
+        auto ptr = view.lock();
+        if (auto bounds = get_workspace_clip(ptr.get());
+            bounds && !(*bounds & output->get_relative_geometry()))
+        {
+            return {};
+        }
+
+        return floating_inner_node_t::keyboard_refocus(output);
+    }
+
+    void gen_render_instances(std::vector<wf::scene::render_instance_uptr>& instances,
+        wf::scene::damage_callback push_damage, wf::output_t *output) override
+    {
+        if (auto ptr = view.lock())
+        {
+            instances.push_back(std::make_unique<isolated_view_render_instance_t>(
+                ptr.get(), this, push_damage, output));
+        }
+    }
 
     std::string stringify() const override
     {

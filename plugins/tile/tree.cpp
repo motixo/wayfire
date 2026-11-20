@@ -492,7 +492,13 @@ void view_node_t::set_geometry(wf::geometry_t geometry, wf::txn::transaction_upt
     tx->add_object(view->toplevel());
 
     auto target = calculate_target_geometry();
-    if (this->needs_crossfade() && (target != view->get_geometry()))
+    // A newly attached view has not been shown at its tile geometry yet.
+    // Crossfading from the client's initial floating geometry adds an extra
+    // full-window render during the opening animation without a useful old tile.
+    const bool crossfade = !first_geometry && this->needs_crossfade() &&
+        (target != view->get_geometry());
+    first_geometry = false;
+    if (crossfade)
     {
         view->get_transformed_node()->rem_transformer(scale_transformer_name);
         ensure_animation(view, animation_duration)

@@ -8,6 +8,8 @@
 #include <wayfire/output.hpp>
 #include <wayfire/workspace-set.hpp>
 #include <wayfire/util/log.hpp>
+#include <algorithm>
+#include <cmath>
 
 static const char *blur_blend_vertex_shader =
     R"(
@@ -103,6 +105,72 @@ int wf_blur_base::calculate_blur_radius()
     return offset_opt * degrade_opt * std::max(1, (int)iterations_opt);
 }
 
+void wf_blur_base::allocate_blur_buffer(wf::auxilliary_buffer_t& buffer, wf::dimensions_t size)
+{
+    // auxilliary_buffer_t::allocate() clamps each dimension to at least one.
+    // Compare/cache the same size, otherwise an empty buffer appears to match
+    // a zero-sized request without ever being allocated.
+    size.width  = std::max(1, size.width);
+    size.height = std::max(1, size.height);
+
+    // Match the allocator's max-size scaling before the cache lookup as well.
+    // Otherwise a capped buffer would be discarded and reallocated every
+    // frame because its actual size differs from the original request.
+    static wf::option_wrapper_t<int> max_buffer_size{"workarounds/max_buffer_size"};
+    const float limit = max_buffer_size;
+    if ((size.width > limit) || (size.height > limit))
+    {
+        const float scale = std::min(limit / size.width, limit / size.height);
+        size.width  = std::ceil(size.width * scale);
+        size.height = std::ceil(size.height * scale);
+    }
+
+    if (buffer.get_size() == size)
+    {
+        return;
+    }
+
+    auto cached = std::find_if(cached_buffers.begin(), cached_buffers.end(),
+        [&] (const auto& entry) { return entry.get_size() == size; });
+    if (cached != cached_buffers.end())
+    {
+        std::swap(buffer, *cached);
+        if (cached->get_buffer())
+        {
+            cached_buffers.splice(cached_buffers.end(), cached_buffers, cached);
+        } else
+        {
+            cached_buffers.erase(cached);
+        }
+    } else
+    {
+        if (buffer.get_buffer())
+        {
+            cached_buffers.emplace_back(std::move(buffer));
+        }
+
+        buffer.allocate(size);
+    }
+
+    // Bound retained memory when damage dimensions vary continuously.
+    constexpr size_t max_cached_buffers = 128;
+    constexpr uint64_t max_cached_pixels = 8'000'000;
+    uint64_t pixels = 0;
+    for (const auto& entry : cached_buffers)
+    {
+        auto dimensions = entry.get_size();
+        pixels += uint64_t(dimensions.width) * dimensions.height;
+    }
+
+    while (!cached_buffers.empty() &&
+           ((cached_buffers.size() > max_cached_buffers) || (pixels > max_cached_pixels)))
+    {
+        auto dimensions = cached_buffers.front().get_size();
+        pixels -= uint64_t(dimensions.width) * dimensions.height;
+        cached_buffers.pop_front();
+    }
+}
+
 void wf_blur_base::render_iteration(wf::region_t blur_region,
     wf::auxilliary_buffer_t& in, wf::auxilliary_buffer_t& out,
     int width, int height)
@@ -112,7 +180,7 @@ void wf_blur_base::render_iteration(wf::region_t blur_region,
     width  = std::max(width, 1);
     height = std::max(height, 1);
 
-    out.allocate({width, height});
+    allocate_blur_buffer(out, {width, height});
 
     GLuint tex_id = wf::gles_texture_t::from_aux(in).tex_id;
 
@@ -176,7 +244,8 @@ wlr_box wf_blur_base::copy_region(wf::auxilliary_buffer_t& result,
     subbox = sanitize(subbox, degrade_opt, source_box);
     int degraded_width  = subbox.width / degrade_opt;
     int degraded_height = subbox.height / degrade_opt;
-    result.allocate({degraded_width, degraded_height});
+    allocate_blur_buffer(result, {degraded_width, degraded_height});
+    const auto allocated_size = result.get_size();
 
     GLuint src_fb = wf::gles::ensure_render_buffer_fb_id(source);
     GLuint dst_fb = wf::gles::ensure_render_buffer_fb_id(result.get_renderbuffer());
@@ -186,8 +255,9 @@ wlr_box wf_blur_base::copy_region(wf::auxilliary_buffer_t& result,
     GL_CALL(glBlitFramebuffer(
         subbox.x, subbox.y,
         subbox.x + subbox.width, subbox.y + subbox.height,
-        0, 0, degraded_width, degraded_height,
+        0, 0, allocated_size.width, allocated_size.height,
         GL_COLOR_BUFFER_BIT, GL_NEAREST));
+
 
     return subbox;
 }
@@ -210,6 +280,14 @@ void wf_blur_base::prepare_blur(const wf::render_target_t& target_fb, const wf::
     /* Scale and translate the region */
     blur_damage += -wf::point_t{damage_box.x, damage_box.y};
     blur_damage *= 1.0 / degrade;
+    const auto allocated_size = fb[0].get_size();
+    if ((allocated_size.width != damage_box.width / degrade) ||
+        (allocated_size.height != damage_box.height / degrade))
+    {
+        // The global buffer limit scaled this snapshot further. Repaint all of
+        // its pixels, since the original damage coordinates no longer match.
+        blur_damage = wlr_box{0, 0, allocated_size.width, allocated_size.height};
+    }
 
     int r = blur_fb0(blur_damage, fb[0].get_size().width, fb[0].get_size().height);
     /* Make sure the result is always fb[0], because that's what is used in render()

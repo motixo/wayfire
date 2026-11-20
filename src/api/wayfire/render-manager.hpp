@@ -271,6 +271,9 @@ class render_manager
     /** Snapshot repaint scheduling state for debugging. */
     render_debug_info_t get_debug_info() const;
 
+    /** Monotonic number of presented output frames, used to detect gaps in sampled metrics. */
+    uint64_t get_presented_frame_count() const;
+
   public:
     class impl;
     std::unique_ptr<impl> pimpl;

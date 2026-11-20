@@ -186,6 +186,7 @@ struct view_node_t : public tree_node_t
   private:
     struct scale_transformer_t;
     nonstd::observer_ptr<scale_transformer_t> transformer;
+    bool first_geometry = true;
 
     wf::signal::connection_t<view_geometry_changed_signal> on_geometry_changed;
     wf::signal::connection_t<tile_adjust_transformer_signal> on_adjust_transformer;

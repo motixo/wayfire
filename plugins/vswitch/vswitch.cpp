@@ -486,6 +486,11 @@ class vswitch : public wf::per_output_plugin_instance_t
 
     bool add_direction(wf::point_t delta, wayfire_view view = nullptr)
     {
+        if ((delta == wf::point_t{0, 0}) && !view && !is_active())
+        {
+            return true;
+        }
+
         if (!is_active() && !start_switch())
         {
             return false;
@@ -669,4 +674,12 @@ class wf_vswitch_global_plugin_t : public wf::per_output_plugin_t<vswitch>
     };
 };
 
-DECLARE_WAYFIRE_PLUGIN(wf_vswitch_global_plugin_t);
+extern "C" __attribute__((visibility("default"))) wf::plugin_interface_t *newInstance()
+{
+    return new wf_vswitch_global_plugin_t;
+}
+
+extern "C" __attribute__((visibility("default"))) uint32_t getWayfireVersion()
+{
+    return WAYFIRE_API_ABI_VERSION;
+}

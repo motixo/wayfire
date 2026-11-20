@@ -182,20 +182,21 @@ void queue_preview_write(pixels_t pixels, const std::filesystem::path& dir,
         std::lock_guard lock(preview_mutex);
         std::error_code error;
         auto current = latest_preview.find(name);
-        if (current == latest_preview.end() || current->second != serial ||
-            !std::filesystem::is_regular_file(temporary, error) ||
-            std::filesystem::file_size(temporary, error) == 0 || error)
+        if (current != latest_preview.end() && current->second == serial)
         {
-            std::filesystem::remove(temporary, error);
-            return;
+            latest_preview.erase(current);
+            if (std::filesystem::is_regular_file(temporary, error) &&
+                std::filesystem::file_size(temporary, error) > 0 && !error)
+            {
+                std::filesystem::rename(temporary, target, error);
+                if (!error)
+                {
+                    return;
+                }
+            }
         }
 
-        std::filesystem::rename(temporary, target, error);
-        latest_preview.erase(current);
-        if (error)
-        {
-            std::filesystem::remove(temporary, error);
-        }
+        std::filesystem::remove(temporary, error);
     }));
 }
 

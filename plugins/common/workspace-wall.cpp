@@ -152,6 +152,26 @@ class workspace_wall_t::workspace_wall_node_t : public scene::node_t
                     const auto ws_bbox     = self->wall->get_workspace_rectangle({i, j});
                     const auto visible_box =
                         geometry_intersection(self->wall->viewport, ws_bbox) - wf::origin(ws_bbox);
+                    if ((visible_box.width <= 0) || (visible_box.height <= 0))
+                    {
+                        continue;
+                    }
+
+                    auto& buffer = self->aux_buffers[i][j];
+                    if (!buffer.get_buffer())
+                    {
+                        auto bbox = self->workspaces[i][j]->get_bounding_box();
+                        buffer.allocate(wf::dimensions(bbox), self->wall->output->handle->scale,
+                            wf::buffer_allocation_hints_t{
+                                .needs_alpha = false,
+                                .hdr_linear  = self->wall->output && self->wall->output->is_hdr(),
+                            });
+                        if (!buffer.get_buffer())
+                        {
+                            continue;
+                        }
+                    }
+
                     wf::regionf_t visible_damage = self->aux_buffer_damage[i][j] & visible_box;
                     if (consider_rescale_workspace_buffer(i, j, visible_damage))
                     {
@@ -192,16 +212,24 @@ class workspace_wall_t::workspace_wall_node_t : public scene::node_t
         {
             data.pass->clear(data.damage, self->wall->background_color);
 
-            auto damage = data.target.framebuffer_region_from_geometry_region(data.damage);
             for (int i = 0; i < (int)self->workspaces.size(); i++)
             {
                 for (int j = 0; j < (int)self->workspaces[i].size(); j++)
                 {
+                    auto& buffer = self->aux_buffers[i][j];
+                    if (!buffer.get_buffer())
+                    {
+                        continue;
+                    }
+
                     auto box = get_workspace_rect({i, j});
                     auto A   = self->wall->viewport;
                     auto B   = self->get_bounding_box();
                     auto render_geometry = wf::scale_box(A, B, box);
-                    auto& buffer = self->aux_buffers[i][j];
+                    if ((data.damage & render_geometry).empty())
+                    {
+                        continue;
+                    }
 
                     float dim = self->wall->get_color_for_workspace({i, j});
                     const auto& subbox = self->aux_buffer_current_subbox[i][j];
@@ -218,8 +246,11 @@ class workspace_wall_t::workspace_wall_node_t : public scene::node_t
                     }
 
                     data.pass->add_texture(tex, data.target, render_geometry, data.damage);
-                    data.pass->add_rect({0, 0, 0, 1.0 - dim}, data.target,
-                        render_geometry, data.damage);
+                    if (dim != 1.0f)
+                    {
+                        data.pass->add_rect({0, 0, 0, 1.0 - dim}, data.target,
+                            render_geometry, data.damage);
+                    }
                 }
             }
 
@@ -260,11 +291,6 @@ class workspace_wall_t::workspace_wall_node_t : public scene::node_t
 
                 auto bbox = workspaces[i][j]->get_bounding_box();
 
-                aux_buffers[i][j].allocate(wf::dimensions(bbox), wall->output->handle->scale,
-                    wf::buffer_allocation_hints_t{
-                        .needs_alpha = false,
-                        .hdr_linear  = wall->output && wall->output->is_hdr(),
-                    });
                 aux_buffer_damage[i][j] |= bbox;
                 aux_buffer_current_scale[i][j]  = 1.0;
                 aux_buffer_current_subbox[i][j] = std::nullopt;

@@ -8,6 +8,7 @@
 #include <wayfire/signal-definitions.hpp>
 #include <set>
 #include <algorithm>
+#include <unordered_map>
 #include <wayfire/nonstd/reverse.hpp>
 #include <wayfire/util/log.hpp>
 #include <wayfire/window-manager.hpp>
@@ -21,6 +22,7 @@
 #include "wayfire/nonstd/tracking-allocator.hpp"
 #include "wayfire/option-wrapper.hpp"
 #include "wayfire/scene-input.hpp"
+#include "wayfire/scene-render.hpp"
 #include "wayfire/scene.hpp"
 #include "wayfire/signal-provider.hpp"
 #include "wayfire/toplevel-view.hpp"
@@ -264,8 +266,22 @@ struct workspace_set_t::impl
             grid.grid.width * workspace_geometry->width, grid.grid.height * workspace_geometry->height
         };
 
+        static wf::option_wrapper_t<bool> isolate_workspaces{"core/isolate_workspaces"};
         for (auto view : get_views(WSET_MAPPED_ONLY))
         {
+            const auto home = get_view_home_workspace(view);
+            if (!grid.is_workspace_valid(home))
+            {
+                const auto nearest = grid.closest_valid_ws(home);
+                if (isolate_workspaces && !view->sticky)
+                {
+                    move_to_workspace(view, nearest);
+                    continue;
+                }
+
+                set_view_home_workspace(view, nearest);
+            }
+
             if (!(view->get_geometry() & full_grid))
             {
                 move_to_workspace(view, get_view_main_workspace(view));
@@ -277,6 +293,15 @@ struct workspace_set_t::impl
         [=] (wf::destruct_signal<view_interface_t> *ev)
     {
         remove_view(toplevel_cast(ev->object));
+    };
+
+    wf::signal::connection_t<view_change_workspace_signal> on_view_workspace_changed =
+        [=] (view_change_workspace_signal *ev)
+    {
+        if (ev->view && (ev->view->get_wset().get() == self))
+        {
+            set_view_home_workspace(ev->view, ev->to);
+        }
     };
 
     bool visible = false;
@@ -330,6 +355,7 @@ struct workspace_set_t::impl
         if (output)
         {
             output->disconnect(&output_geometry_changed);
+            output->disconnect(&on_view_workspace_changed);
             wf::scene::remove_child(wnode);
         }
 
@@ -342,6 +368,7 @@ struct workspace_set_t::impl
         {
             change_output_geometry(new_output->get_relative_geometry());
             new_output->connect(&output_geometry_changed);
+            new_output->connect(&on_view_workspace_changed);
             scene::add_front(new_output->node_for_layer(scene::layer::WORKSPACE), wnode);
         }
 
@@ -387,6 +414,7 @@ struct workspace_set_t::impl
 
         LOGC(WSET, "Adding view ", view, " to wset ", index);
         wset_views.push_back(view);
+        home_workspaces[view.get()] = {current_vx, current_vy};
         view->connect(&on_view_destruct);
         view->priv->current_wset = self->weak_from_this();
         view->set_output(this->output);
@@ -403,6 +431,7 @@ struct workspace_set_t::impl
 
         LOGC(WSET, "Removing view ", view, " from id=", index);
         wset_views.erase(it);
+        home_workspaces.erase(view.get());
         view->disconnect(&on_view_destruct);
         view->priv->current_wset.reset();
     }
@@ -470,13 +499,55 @@ struct workspace_set_t::impl
 
   private:
     std::vector<wayfire_toplevel_view> wset_views;
+    std::unordered_map<view_interface_t*, wf::point_t> home_workspaces;
 
     int current_vx = 0;
     int current_vy = 0;
 
   public:
+    void set_view_home_workspace(wayfire_toplevel_view view, wf::point_t workspace)
+    {
+        auto it = home_workspaces.find(view.get());
+        if ((it != home_workspaces.end()) && (it->second == workspace))
+        {
+            return;
+        }
+
+        static wf::option_wrapper_t<bool> isolate_workspaces{"core/isolate_workspaces"};
+        const bool changes_visibility = isolate_workspaces && !view->sticky;
+        // Changing only the logical workspace does not move the scene node.
+        // Damage both ownership states so the old workspace drops the view and
+        // the new workspace paints it without waiting for another animation.
+        if (changes_visibility)
+        {
+            wf::scene::damage_node(view->get_root_node(), view->get_bounding_box());
+        }
+
+        home_workspaces[view.get()] = workspace;
+        if (changes_visibility)
+        {
+            wf::scene::damage_node(view->get_root_node(), view->get_bounding_box());
+        }
+    }
+
+    wf::point_t get_view_home_workspace(wayfire_toplevel_view view)
+    {
+        if (auto it = home_workspaces.find(view.get()); it != home_workspaces.end())
+        {
+            return it->second;
+        }
+
+        return {current_vx, current_vy};
+    }
+
     wf::point_t get_view_main_workspace(wayfire_toplevel_view view)
     {
+        static wf::option_wrapper_t<bool> isolate_workspaces{"core/isolate_workspaces"};
+        if (isolate_workspaces && home_workspaces.count(view.get()))
+        {
+            return get_view_home_workspace(view);
+        }
+
         if (!workspace_geometry)
         {
             LOGW("Workspace-set id=", index, " does not have any output/geometry yet!");
@@ -500,6 +571,12 @@ struct workspace_set_t::impl
      */
     bool view_visible_on(wayfire_toplevel_view view, wf::point_t vp)
     {
+        static wf::option_wrapper_t<bool> isolate_workspaces{"core/isolate_workspaces"};
+        if (isolate_workspaces && !view->sticky && home_workspaces.count(view.get()))
+        {
+            return get_view_home_workspace(view) == vp;
+        }
+
         if (!workspace_geometry)
         {
             LOGW("Workspace-set id=", index, " does not have any output/geometry yet!");
@@ -533,6 +610,8 @@ struct workspace_set_t::impl
         {
             ws = {current_vx, current_vy};
         }
+
+        set_view_home_workspace(view, ws);
 
         auto box = view->get_pending_geometry();
         wf::geometry_t visible = *workspace_geometry;
@@ -620,6 +699,7 @@ struct workspace_set_t::impl
 
         for (auto& [v, old_workspace] : old_fixed_view_workspaces)
         {
+            set_view_home_workspace(v, nws);
             wf::view_change_workspace_signal vdata;
             vdata.view = v;
             vdata.from = old_workspace;
@@ -671,6 +751,11 @@ void workspace_set_t::set_visible(bool visible)
 wf::point_t workspace_set_t::get_view_main_workspace(wayfire_toplevel_view view)
 {
     return pimpl->get_view_main_workspace(view);
+}
+
+wf::point_t workspace_set_t::get_view_home_workspace(wayfire_toplevel_view view)
+{
+    return pimpl->get_view_home_workspace(view);
 }
 
 bool workspace_set_t::view_visible_on(wayfire_toplevel_view view, wf::point_t ws)

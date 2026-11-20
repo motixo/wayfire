@@ -1,5 +1,5 @@
-#include <wayfire/config/config-manager.hpp>
 #include <wayfire/core.hpp>
+#include <wayfire/matcher.hpp>
 #include <wayfire/output.hpp>
 #include <wayfire/plugin.hpp>
 #include <wayfire/signal-definitions.hpp>
@@ -92,12 +92,7 @@ class window_sizes_plugin_t : public wf::plugin_interface_t
     std::map<std::string, std::vector<remembered_t>> sizes;
     std::map<uint64_t, open_view_t> open_views;
     std::filesystem::path file = state_path();
-
-    bool floating_mode() const
-    {
-        auto option = wf::get_core().config->get_option("simple-tile/tile_by_default");
-        return !option || option->get_value_str() == "none";
-    }
+    wf::view_matcher_t tile_by_default{"simple-tile/tile_by_default"};
 
     bool eligible(wayfire_toplevel_view view) const
     {
@@ -114,8 +109,7 @@ class window_sizes_plugin_t : public wf::plugin_interface_t
 
     bool floating(wayfire_toplevel_view view) const
     {
-        return floating_mode() && !view->pending_fullscreen() &&
-            view->pending_tiled_edges() == 0;
+        return !view->pending_fullscreen() && (view->pending_tiled_edges() == 0);
     }
 
     std::optional<window_size_t> matching_size(const std::string& app_id, window_size_t initial) const
@@ -335,7 +329,8 @@ class window_sizes_plugin_t : public wf::plugin_interface_t
             }
 
             auto view = wf::toplevel_cast(wf::find_view_for_toplevel(toplevel));
-            if (!eligible(view) || !floating(view) || open_views.count(view->get_id()))
+            if (!eligible(view) || !floating(view) || tile_by_default.matches(view) ||
+                open_views.count(view->get_id()))
             {
                 continue;
             }

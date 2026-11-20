@@ -7,7 +7,7 @@ jobs:
     runs-on: ubuntu-latest
     container: alpine:latest
     steps:
-    - run: apk --no-cache add git gcc g++ binutils pkgconf meson ninja musl-dev wayland-protocols libinput-dev libevdev-dev libxkbcommon-dev pixman-dev glm-dev mesa-dev cairo-dev pango-dev eudev-dev libxml2-dev libseat-dev libxcb-dev xcb-util-wm-dev xwayland doctest doctest-dev cmake libdisplay-info-dev hwdata-dev libdrm-dev yyjson-dev wayland-dev
+    - run: apk --no-cache add git gcc g++ binutils pkgconf meson ninja musl-dev wayland-protocols libinput-dev libevdev-dev libxkbcommon-dev pixman-dev glm-dev mesa-dev cairo-dev pango-dev eudev-dev libxml2-dev libseat-dev libxcb-dev xcb-util-wm-dev xwayland doctest doctest-dev cmake libdisplay-info-dev hwdata-dev libdrm-dev yyjson-dev json-c-dev wayland-dev
     - run: git clone https://gitlab.freedesktop.org/wayland/wayland-protocols -b 1.47 && cd wayland-protocols && meson setup build --prefix=/usr && ninja -C build && ninja -C build install && cd .. && rm -rf wayland-protocols
     - uses: actions/checkout@v1
     - run: git config --global --add safe.directory /__w/wayfire/wayfire
@@ -23,7 +23,7 @@ jobs:
         image: archlinux:latest
     steps:
     - run: pacman --noconfirm --noprogressbar -Syyu
-    - run: pacman --noconfirm --noprogressbar -Sy git clang lld libc++ pkgconf cmake meson ninja wayland wayland-protocols libinput libxkbcommon pixman glm libdrm libglvnd cairo pango systemd scdoc base-devel seatd hwdata libdisplay-info openmp doctest yyjson
+    - run: pacman --noconfirm --noprogressbar -Sy git clang lld libc++ pkgconf cmake meson ninja wayland wayland-protocols libinput libxkbcommon pixman glm libdrm libglvnd cairo pango systemd scdoc base-devel seatd hwdata libdisplay-info openmp doctest yyjson json-c
 
       # Build Wayfire
     - uses: actions/checkout@v1

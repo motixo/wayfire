@@ -96,8 +96,8 @@ class wf_kawase_blur : public wf_blur_base
 
         for (int i = 0; i < iterations; i++)
         {
-            sampleWidth  = width / (1 << i);
-            sampleHeight = height / (1 << i);
+            sampleWidth  = std::max(1, width / (1 << i));
+            sampleHeight = std::max(1, height / (1 << i));
 
             auto region = blur_region * (1.0 / (1 << i));
 
@@ -115,8 +115,8 @@ class wf_kawase_blur : public wf_blur_base
         program[1].uniform1f("offset", offset);
         for (int i = iterations - 1; i >= 0; i--)
         {
-            sampleWidth  = width / (1 << i);
-            sampleHeight = height / (1 << i);
+            sampleWidth  = std::max(1, width / (1 << i));
+            sampleHeight = std::max(1, height / (1 << i));
 
             auto region = blur_region * (1.0 / (1 << i));
 

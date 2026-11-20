@@ -756,6 +756,7 @@ class wf::render_manager::impl
     adaptive_repaint_scheduler_t repaint_scheduler;
     std::deque<pending_render_timer_t> pending_render_timers;
     render_timer_support_t render_timer_support = render_timer_support_t::UNKNOWN;
+    uint64_t presented_frames = 0;
     repaint_schedule_t last_schedule;
 
     wf::option_wrapper_t<int> min_render_budget;
@@ -916,18 +917,23 @@ class wf::render_manager::impl
             }
 
 #endif
+            const bool timing_reliable =
+                (event->flags & (WLR_OUTPUT_PRESENT_HW_CLOCK | WLR_OUTPUT_PRESENT_HW_COMPLETION)) ==
+                (WLR_OUTPUT_PRESENT_HW_CLOCK | WLR_OUTPUT_PRESENT_HW_COMPLETION);
             consume_render_timer(commit_seq,
-                event->flags & WLR_OUTPUT_PRESENT_HW_COMPLETION);
+                event->flags & WLR_OUTPUT_PRESENT_HW_COMPLETION,
+                timing_reliable && event->presented ?
+                std::optional<int64_t>{timespec_to_ns(event->when)} : std::nullopt);
             repaint_scheduler.handle_presentation({
                     commit_seq,
                     event->presented,
                     timespec_to_ns(event->when),
                     event->refresh,
-                    (event->flags & (WLR_OUTPUT_PRESENT_HW_CLOCK | WLR_OUTPUT_PRESENT_HW_COMPLETION)) ==
-                    (WLR_OUTPUT_PRESENT_HW_CLOCK | WLR_OUTPUT_PRESENT_HW_COMPLETION),
+                    timing_reliable,
                 });
             if (event->presented)
             {
+                ++presented_frames;
                 arm_vrr_idle_timer();
             }
         });
@@ -1155,7 +1161,8 @@ class wf::render_manager::impl
         }
     }
 
-    void consume_render_timer_at(std::deque<pending_render_timer_t>::iterator pending)
+    void consume_render_timer_at(std::deque<pending_render_timer_t>::iterator pending,
+        std::optional<int64_t> presented_at_ns = std::nullopt)
     {
         const int timer_duration_ns = wlr_render_timer_get_duration_ns(pending->timer.get());
         if (timer_duration_ns >= 0)
@@ -1164,15 +1171,28 @@ class wf::render_manager::impl
                 pending->committed_ns - pending->paint_started_ns);
             const int64_t render_completion_ns = std::max<int64_t>(0,
                 pending->timer_started_ns - pending->paint_started_ns) + timer_duration_ns;
-            repaint_scheduler.observe_render_completion(pending->commit_seq,
-                repaint_path_t::COMPOSED,
-                std::max(cpu_duration_ns, render_completion_ns));
+            const int64_t completed_frame_ns = std::max(cpu_duration_ns, render_completion_ns);
+            // A completed frame cannot finish rendering after its hardware
+            // presentation (or after we read the completed timer). Some GLES
+            // drivers occasionally return a valid-looking but inconsistent
+            // timestamp; using it would make the adaptive paint budget grow
+            // to hundreds of milliseconds while the output still runs at 120 Hz.
+            constexpr int64_t CLOCK_TOLERANCE_NS = 1'000'000;
+            const int64_t latest_completion_ns =
+                presented_at_ns.value_or(get_monotonic_time_ns()) - pending->paint_started_ns +
+                CLOCK_TOLERANCE_NS;
+            if (completed_frame_ns <= latest_completion_ns)
+            {
+                repaint_scheduler.observe_render_completion(pending->commit_seq,
+                    repaint_path_t::COMPOSED, completed_frame_ns);
+            }
         }
 
         pending_render_timers.erase(pending);
     }
 
-    void consume_render_timer(uint32_t commit_seq, bool completion_known)
+    void consume_render_timer(uint32_t commit_seq, bool completion_known,
+        std::optional<int64_t> presented_at_ns)
     {
         auto pending = std::find_if(pending_render_timers.begin(),
             pending_render_timers.end(), [=] (const auto& candidate)
@@ -1184,7 +1204,7 @@ class wf::render_manager::impl
             return;
         }
 
-        consume_render_timer_at(pending);
+        consume_render_timer_at(pending, presented_at_ns);
     }
 
     void consume_available_render_timers()
@@ -1799,6 +1819,11 @@ wf::explicit_sync_point_t render_manager::next_explicit_sync_render_point()
 render_debug_info_t render_manager::get_debug_info() const
 {
     return pimpl->get_debug_info();
+}
+
+uint64_t render_manager::get_presented_frame_count() const
+{
+    return pimpl->presented_frames;
 }
 
 wf::render_pass_t*render_manager::get_current_pass()

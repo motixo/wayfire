@@ -1,216 +1,27 @@
-# [Wayfire]
+# Wayfire desktop fork
 
-[Wayfire]: https://wayfire.org
+A fork of [Wayfire](https://github.com/WayfireWM/wayfire) with built-in plugins for a desktop that mixes tiled and floating windows.
 
-![Version](https://img.shields.io/github/v/release/WayfireWM/wayfire)
-[![Matrix: #wayfire:matrix.org](https://img.shields.io/badge/matrix-%23wayfire%3Amatrix.org-blue)](https://matrix.to/#/#wayfire:matrix.org)
-[![IRC: #wayfire on Libera.chat](https://img.shields.io/badge/IRC-%23wayfire%20at%20libera.chat-green)](https://web.libera.chat/#wayfire)
-[![Discord](https://img.shields.io/discord/1144831589877043220?label=Discord)](https://discord.gg/5SWAxmBCUH)
-[![CI](https://github.com/WayfireWM/wayfire/workflows/CI/badge.svg)](https://github.com/WayfireWM/wayfire/actions)
-[![Packaging status](https://repology.org/badge/tiny-repos/wayfire.svg)](https://repology.org/project/wayfire/versions)
-[![License](https://img.shields.io/github/license/WayfireWM/wayfire)](LICENSE)
+## What this fork adds
 
-###### [Get started] | [Manual] | [Configuration]
+- **Window appearance:** `panel-decor` draws themed title bars for windows that use server-side decorations. It reads the Desktop Settings palette and can use Tabler button icons. `rounded-windows` clips content to the configured corner radius and draws a palette-aware active border that hides in fullscreen.
+- **Floating windows:** `window-sizes` remembers resized windows and opens them at their saved size, centered in the work area.
+- **Tiling and workspaces:** Simple Tile can use a Dwindle layout and swap tiles by dragging their title bars. Optional workspace clipping keeps windows inside their own workspace. `tile-focus` brings tiles into focus as the pointer enters them and uses a fade when they open.
+- **Dock previews:** `dock-snapshot` captures live and minimized window previews for a dock over Wayfire IPC.
+- **Rendering:** The fork adjusts adaptive repaint timing, adds a presented-frame counter to `wayfire/render-metrics`, and changes how blur, workspace transitions, and window maximization are rendered.
 
-[Get started]: https://github.com/WayfireWM/wayfire/wiki/Tutorial
-[Manual]: https://github.com/WayfireWM/wayfire/wiki/General
-[Configuration]: https://github.com/WayfireWM/wayfire/wiki/Configuration
+## Build and configure
 
-Wayfire is a 3D [Wayland] compositor, inspired by [Compiz] and based on [wlroots].
-
-It aims to create a customizable, extendable and lightweight environment without sacrificing its appearance.
-
-[![Wayfire demos](https://img.youtube.com/vi_webp/2PtNzxDsxYM/maxresdefault.webp)](https://youtube.com/playlist?list=PLb7YRKEhWEBUIoT-a29UoJW9mhfzjpNle "YouTube – Wayfire demos")
-[![YouTube Play Button](https://www.iconfinder.com/icons/317714/download/png/16)](https://youtube.com/playlist?list=PLb7YRKEhWEBUIoT-a29UoJW9mhfzjpNle) · [Wayfire demos](https://youtube.com/playlist?list=PLb7YRKEhWEBUIoT-a29UoJW9mhfzjpNle)
-
-[Wayland]: https://wayland.freedesktop.org
-[wlroots]: https://github.com/swaywm/wlroots
-[Compiz]: https://launchpad.net/compiz
-
-## Dependencies
-
-### Wayfire Dependencies
-
-These are the dependencies needed for building Wayfire.
-
-- [Cairo](https://cairographics.org)
-- [Pango](https://pango.gnome.org/) and PangoCairo
-- [FreeType](https://freetype.org)
-- [GLM](https://glm.g-truc.net)
-- [libdrm](https://dri.freedesktop.org/wiki/DRM/)
-- [libevdev](https://freedesktop.org/wiki/Software/libevdev/)
-- [libGL](https://mesa3d.org)
-- [libinput](https://freedesktop.org/wiki/Software/libinput/)
-- [libjpeg](https://libjpeg-turbo.org)
-- [libpng](http://libpng.org/pub/png/libpng.html)
-- [libxkbcommon](https://xkbcommon.org)
-- [libxml2](http://xmlsoft.org/)
-- json-c for the desktop plugins, plus optional librsvg for SVG button icons
-- [Pixman](https://pixman.org)
-- [pkg-config](https://freedesktop.org/wiki/Software/pkg-config/)
-- [Wayland](https://wayland.freedesktop.org)
-- [wayland-protocols](https://gitlab.freedesktop.org/wayland/wayland-protocols)
-- [wf-config](https://github.com/WayfireWM/wf-config)
-- [wlroots](https://github.com/swaywm/wlroots)
-
-### wlroots Dependencies
-
-These are the dependencies needed for building wlroots, and should be installed before building it.
-They are relevant for cases when the system doesn't have a version of wlroots installed.
-
-#### DRM Backend (required)
-
-- [libdisplay-info-dev](https://gitlab.freedesktop.org/emersion/libdisplay-info)
-- [hwdata-dev](https://github.com/vcrhonek/hwdata)
-
-#### GLES2 renderer (required)
-- [libglvnd](https://gitlab.freedesktop.org/glvnd/libglvnd)
-- [mesa](https://gitlab.freedesktop.org/mesa/mesa) (with libEGL and gbm support)
-
-#### Libinput Backend (required)
-- [libinput](https://gitlab.freedesktop.org/libinput/libinput)
-
-#### Session Provider (required)
-
-- libudev (via [systemd](https://systemd.io/) **or** other providers)
-- [seatd](https://git.sr.ht/~kennylevinsen/seatd)
-
-#### XWayland Support (optional)
-
-- [xcb](https://xcb.freedesktop.org/)
-- [xcb-composite](https://xorg.freedesktop.org/wiki/)
-- [xcb-render](https://xorg.freedesktop.org/wiki/)
-- [xcb-xfixes](https://xorg.freedesktop.org/wiki/)
-
-#### X11 Backend (optional)
-
-- [xcb](https://xcb.freedesktop.org/)
-- [x11-xcb](https://xcb.freedesktop.org/)
-- [xcb-xinput](https://xorg.freedesktop.org/wiki/)
-- [xcb-xfixes](https://xorg.freedesktop.org/wiki/)
-
-## Installation
-
-The easiest way to install Wayfire, wf-shell and WCM to get a functional desktop is to use the [install scripts](https://github.com/WayfireWM/wf-install).
-
-Alternatively, you can build from source:
-
-``` sh
-meson build
-ninja -C build
-sudo ninja -C build install
-```
-
-**Note**: `wf-config` and `wlroots` can be built as submodules, by specifying
-`-Duse_system_wfconfig=disabled` and `-Duse_system_wlroots=disabled` options to `meson`.
-This is the default if they are not present on your system.
-
-Installing [wf-shell](https://github.com/WayfireWM/wf-shell) is recommended for a complete experience.
-
-External plugins can be installed either manually or with `wayfire-plugin`, for example:
+Install the [upstream build dependencies](https://github.com/WayfireWM/wayfire#dependencies) and `json-c`. Install `librsvg` for SVG button icons. Rounded corners and dock previews use GLES. Dock previews also require image I/O support in the build.
 
 ```sh
-wayfire-plugin install https://github.com/soreau/pixdecor
+git submodule update --init subprojects/wf-config subprojects/wf-json subprojects/wf-touch subprojects/wf-utils
+meson setup build -Duse_system_wlroots=enabled -Duse_system_wfconfig=disabled
+meson compile -C build
 ```
 
-See [Managing External Plugins](docs/wayfire-plugin.md) for more information.
+This example uses system wlroots 0.20. In `wayfire.ini`, replace `decoration` with `panel-decor` in `[core] plugins`. Add `rounded-windows`, `window-sizes`, `simple-tile` with `tile-focus`, or `ipc` with `dock-snapshot` as needed. Use the unversioned names when migrating from the standalone builds.
 
-### Desktop plugins in this fork
+Set `layout_mode = dwindle` in `[simple-tile]` for Dwindle and `isolate_workspaces = true` in `[core]` for workspace clipping.
 
-The normal Meson build includes the following modules. Add the names you want
-to `[core]` → `plugins` in `wayfire.ini`:
-
-- `panel-decor` supplies themed server-side title bars in place of
-  `decoration`. It reads the Desktop Settings palette and uses the bundled
-  Tabler icons when the Quickshell equivalents are absent.
-- `rounded-windows` applies the `[panel-decor]` corner radius and draws the
-  active border. It requires the GLES renderer.
-- `window-sizes` remembers resized floating windows and centers them at
-  their saved size on the next launch. It uses the same
-  `$XDG_STATE_HOME/wayfire-window-sizes/sizes.json` state file as the standalone
-  plugin, with a fallback under `~/.local/state`.
-- `tile-focus` follows the pointer in tiled workspaces and uses a fade for
-  tiled window openings. It follows `[simple-tile]` → `tile_by_default`.
-- `dock-snapshot` captures minimized windows and provides live previews over
-  Wayfire IPC. It builds when image I/O is available and uses the GLES renderer.
-
-For a configuration using the standalone hot reload names, replace
-`rounded-windows-r16` and `window-sizes-r4` with the unversioned names above.
-The `[panel-decor]` and `[rounded-windows]` settings use the same option names.
-
-###### Arch Linux
-
-[wayfire](https://aur.archlinux.org/packages/wayfire/) and [wayfire-git] are available in the [AUR].
-
-``` sh
-yay -S wayfire
-```
-
-[AUR]: https://aur.archlinux.org
-[wayfire-git]: https://aur.archlinux.org/packages/wayfire-git/
-
-###### Exherbo
-
-``` sh
-cave resolve -x wayfire
-```
-
-###### Fedora
-
-``` sh
-dnf install wayfire
-```
-
-###### FreeBSD
-Install the latest release and recommended addons with
-``` sh
-pkg install wayfire wayfire-plugins-extra wf-shell wcm
-```
-
-###### Gentoo
-Install the latest release with
-```sh
-emerge --ask --verbose wayfire
-```
-and to use the live version
-```sh
-emerge --ask --verbose "=gui-wm/wayfire-9999"
-```
-
-###### NixOS
-
-Enable Wayfire in your NixOS configuration:
-```nix
-programs.wayfire = {
-  enable = true;
-  plugins = with pkgs.wayfirePlugins; [
-    wcm
-    wf-shell
-    wayfire-plugins-extra
-  ];
-};
-```
-
-###### Ubuntu/Debian 13
-
-```
-apt install wayfire
-```
-
-###### Void
-
-``` sh
-xbps-install -S wayfire
-```
-
-## Configuration
-
-Copy [`wayfire.ini`] to `~/.config/wayfire.ini` or `~/.config/wayfire/wayfire.ini`.
-Before running Wayfire, you may want to change the command to start a terminal.
-See the [Configuration] document for information on the options.
-
-[`wayfire.ini`]: wayfire.ini
-
-## Running
-
-Run [`wayfire`][Manual] from a TTY, or via a Wayland-compatible login manager.
+[Upstream configuration guide](https://github.com/WayfireWM/wayfire/wiki/Configuration) · [MIT license](LICENSE)

@@ -71,6 +71,7 @@ repaint_scheduler_debug_info_t adaptive_repaint_scheduler_t::get_debug_info(
         .refresh_ns     = refresh_ns,
         .pending_frames = static_cast<uint32_t>(pending_frames.size()),
         .consecutive_scanouts = consecutive_scanouts,
+        .dynamic_delay_penalty_ns = dynamic_delay_penalty_ns,
         .predicted_path = predict_path(),
         .composed = path_info(repaint_path_t::COMPOSED),
         .direct_scanout = path_info(repaint_path_t::DIRECT_SCANOUT),
@@ -82,6 +83,7 @@ repaint_schedule_t adaptive_repaint_scheduler_t::schedule_frame(
 {
     repaint_schedule_t result;
     result.predicted_path = predict_path();
+    result.dynamic_delay_requested = dynamic_delay;
 
     if (((min_render_budget_ms < 0) && !dynamic_delay) || !last_presentation_ns || (refresh_ns <= 0))
     {
@@ -123,7 +125,16 @@ repaint_schedule_t adaptive_repaint_scheduler_t::schedule_frame(
 
     // VRR has no fixed missed-vblank semantics, but pacing an active stream to
     // the mode's fastest interval avoids immediate, irregular back-to-back flips.
-    const int64_t delay_ns = *result.target_presentation_ns - budget_ns - now_ns;
+    int64_t delay_ns = *result.target_presentation_ns - budget_ns - now_ns;
+    if (dynamic_delay)
+    {
+        // The paint estimate does not include the backend's page-flip latch
+        // deadline. At high refresh rates, delaying almost a whole period can
+        // miss a vblank even if the GPU timer says rendering finished in time.
+        // Keep most of the interval available for render and scanout.
+        delay_ns = std::min(delay_ns,
+            std::max<int64_t>(0, refresh_ns / 4 - dynamic_delay_penalty_ns));
+    }
     if (delay_ns > 0)
     {
         result.repaint_deadline_ns = now_ns + delay_ns;
@@ -191,7 +202,8 @@ void adaptive_repaint_scheduler_t::submit_frame(const repaint_schedule_t& schedu
     pending_frames.push_back({commit_seq, path, schedule.target_presentation_ns,
         path == repaint_path_t::DIRECT_SCANOUT ?
         std::optional<int64_t>{committed_ns} : std::nullopt,
-        paint_started_ns, refresh_ns, vrr_enabled});
+        paint_started_ns, refresh_ns, vrr_enabled,
+        schedule.dynamic_delay_requested && (schedule.delay_ns > 0)});
     if (pending_frames.size() > MAX_PENDING_FRAMES)
     {
         pending_frames.pop_front();
@@ -289,6 +301,17 @@ void adaptive_repaint_scheduler_t::handle_presentation(const repaint_presentatio
 
         if (lateness > tolerance)
         {
+            if (pending->dynamic_delay_applied)
+            {
+                // A late presentation can be caused by the backend's latch
+                // deadline even when rendering completed before the target.
+                // Back off the delay itself, since a larger paint estimate is
+                // masked by the delay cap at high refresh rates.
+                const int64_t max_delay = pending->refresh_ns / 4;
+                dynamic_delay_penalty_ns = std::min(max_delay,
+                    dynamic_delay_penalty_ns + std::max<int64_t>(1, (max_delay + 1) / 2));
+            }
+
             // If rendering completes after the target presentation, we know that the paint budget itself
             // was underestimated. In these cases, we don't record a miss: the paint budget estimation should
             // be updated in update_duration / raise_duration_estimate.
@@ -303,6 +326,9 @@ void adaptive_repaint_scheduler_t::handle_presentation(const repaint_presentatio
         } else
         {
             record_success(get_estimator(pending->path), completion_slack_ns);
+            // Probe more delay only after sustained successful presentations.
+            dynamic_delay_penalty_ns = std::max<int64_t>(0,
+                dynamic_delay_penalty_ns - std::max<int64_t>(1, pending->refresh_ns / 800));
         }
     }
 
@@ -318,6 +344,7 @@ void adaptive_repaint_scheduler_t::reset(bool reset_estimates)
     last_path = repaint_path_t::COMPOSED;
     if (reset_estimates)
     {
+        dynamic_delay_penalty_ns = 0;
         composed = {};
         scanout  = {};
     }

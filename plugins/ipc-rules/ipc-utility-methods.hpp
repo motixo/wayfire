@@ -168,6 +168,7 @@ class ipc_rules_utility_methods_t
 
         response["has-last-presentation"] = info.has_last_presentation;
         response["last-presentation-ns"]  = info.last_presentation_ns;
+        response["presented-frames"] = output->render->get_presented_frame_count();
         response["refresh-ns"] = info.refresh_ns;
         response["pending-scheduler-frames"] = info.pending_scheduler_frames;
         response["consecutive-scanouts"]     = info.consecutive_scanouts;

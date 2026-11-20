@@ -10,4 +10,5 @@ blur = shared_module('blur', ['blur.cpp'],
      link_with: blur_base,
      include_directories: [wayfire_api_inc, wayfire_conf_inc],
      dependencies: [wlroots, pixman, wfconfig, plugin_pch_dep],
+     gnu_symbol_visibility: 'hidden',
      install: true, install_dir: join_paths(get_option('libdir'), 'wayfire'))

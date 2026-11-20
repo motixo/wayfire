@@ -1,5 +1,6 @@
 #include <memory>
 #include <wayfire/config/types.hpp>
+#include <wayfire/config/config-manager.hpp>
 #include <wayfire/per-output-plugin.hpp>
 #include <wayfire/output.hpp>
 #include <wayfire/core.hpp>
@@ -100,12 +101,13 @@ class tile_output_plugin_t : public wf::pointer_interaction_t, public wf::custom
     }
 
     template<class Controller>
-    void start_controller()
+    void start_controller(wayfire_toplevel_view requested_view = nullptr)
     {
-        auto tiled_focus = get_tiled_focus();
+        auto tiled_focus = requested_view ? requested_view : get_tiled_focus();
 
         /* No action possible in this case */
-        if (has_fullscreen_view() || !tiled_focus)
+        if (has_fullscreen_view() || !tiled_focus ||
+            (tiled_focus->get_output() != output) || !tile::view_node_t::get_node(tiled_focus))
         {
             return;
         }
@@ -168,6 +170,17 @@ class tile_output_plugin_t : public wf::pointer_interaction_t, public wf::custom
             {
                 attach_view(toplevel);
             }
+        }
+    };
+
+    // SSD and CSD title bars both send a move request after the user drags
+    // them. Route tiled views to Simple Tile's existing drop/swap controller.
+    wf::signal::connection_t<view_move_request_signal> on_titlebar_move_request =
+        [=] (view_move_request_signal *ev)
+    {
+        if (ev->view && tile::view_node_t::get_node(ev->view))
+        {
+            start_controller<tile::move_view_controller_t>(ev->view);
         }
     };
 
@@ -405,7 +418,11 @@ class tile_output_plugin_t : public wf::pointer_interaction_t, public wf::custom
     {
         this->output = wo;
         input_grab   = std::make_unique<wf::input_grab_t>("simple-tile", output, nullptr, this, nullptr);
+        // A titlebar started the button press before we installed this grab.
+        // Receive its release even though this node never saw the press.
+        input_grab->set_wants_raw_input(true);
         output->connect(&on_view_mapped);
+        output->connect(&on_titlebar_move_request);
         output->connect(&on_tile_request);
         output->connect(&on_fullscreen_request);
         output->connect(&on_view_change_workspace);
@@ -441,6 +458,7 @@ class tile_plugin_t : public wf::plugin_interface_t, wf::per_output_tracker_mixi
         ipc_repo->register_method("simple-tile/get-layout", ipc_get_layout);
         ipc_repo->register_method("simple-tile/set-layout", ipc_set_layout);
         ipc_repo->register_method("simple-tile/set-show-maximized", ipc_set_show_maximized);
+        ipc_repo->register_method("simple-tile/set-tile-by-default", ipc_set_tile_by_default);
         preview_manager = std::make_unique<tile::drag_manager_t>();
     }
 
@@ -461,6 +479,7 @@ class tile_plugin_t : public wf::plugin_interface_t, wf::per_output_tracker_mixi
         ipc_repo->unregister_method("simple-tile/get-layout");
         ipc_repo->unregister_method("simple-tile/set-layout");
         ipc_repo->unregister_method("simple-tile/set-show-maximized");
+        ipc_repo->unregister_method("simple-tile/set-tile-by-default");
     }
 
     void stop_controller(std::shared_ptr<wf::workspace_set_t> wset)
@@ -561,6 +580,31 @@ class tile_plugin_t : public wf::plugin_interface_t, wf::per_output_tracker_mixi
     ipc::method_callback ipc_set_show_maximized = [=] (wf::json_t params) -> wf::json_t
     {
         return tile::handle_ipc_set_show_maximized(params);
+    };
+
+    ipc::method_callback ipc_set_tile_by_default = [=] (const wf::json_t& params) -> wf::json_t
+    {
+        if (!params.is_object() || !params.has_member("value") || !params["value"].is_string())
+        {
+            return wf::ipc::json_error("Expected a string value");
+        }
+
+        const auto value = params["value"].as_string();
+        if ((value != "all") && (value != "none"))
+        {
+            return wf::ipc::json_error("Value must be all or none");
+        }
+
+        // Updating the matcher notifies Simple Tile directly. A global config-reload
+        // signal would also reconfigure outputs and rules during a workspace animation.
+        auto option = wf::get_core().config->get_option("simple-tile/tile_by_default");
+        if (!option || !option->set_value_str(value))
+        {
+            return wf::ipc::json_error("Could not update tile_by_default");
+        }
+
+        option->set_locked(true);
+        return wf::ipc::json_ok();
     };
 };
 

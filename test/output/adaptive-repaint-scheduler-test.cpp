@@ -7,6 +7,7 @@ namespace
 {
 constexpr int64_t MS = 1'000'000;
 constexpr int64_t PERIOD_60HZ = 16'666'667;
+constexpr int64_t PERIOD_120HZ = 8'333'333;
 
 wf::repaint_presentation_t present(uint32_t seq, int64_t when,
     int64_t refresh = PERIOD_60HZ)
@@ -36,8 +37,7 @@ TEST_CASE("Repaint scheduler starts conservatively and uses presentation deadlin
     scheduler.handle_presentation(present(2, 100 * MS + PERIOD_60HZ));
 
     auto learned = scheduler.schedule_frame(100 * MS + PERIOD_60HZ, 1, true, false);
-    CHECK(delay_ms(learned) >= 13);
-    CHECK(delay_ms(learned) <= 14);
+    CHECK(learned.delay_ns == PERIOD_60HZ / 4);
 }
 
 TEST_CASE("Dynamic repaint treats a disabled minimum budget as a zero floor")
@@ -57,6 +57,86 @@ TEST_CASE("Dynamic repaint treats a disabled minimum budget as a zero floor")
 
     auto learned = scheduler.schedule_frame(first.target_presentation_ns.value(), -1, true, false);
     CHECK(learned.delay_ns > 0);
+}
+
+TEST_CASE("Dynamic repaint keeps scanout headroom at 120 Hz")
+{
+    wf::adaptive_repaint_scheduler_t scheduler;
+    scheduler.handle_presentation(present(1, 100 * MS, PERIOD_120HZ));
+    auto first = scheduler.schedule_frame(100 * MS, -1, true, false);
+    scheduler.submit_frame(first, wf::repaint_path_t::COMPOSED,
+        100 * MS, 102 * MS, 2, false);
+    const int64_t anchor = first.target_presentation_ns.value();
+    scheduler.handle_presentation(present(2, anchor, PERIOD_120HZ));
+
+    auto early = scheduler.schedule_frame(anchor, -1, true, false);
+    CHECK(early.delay_ns == PERIOD_120HZ / 4);
+    CHECK(early.repaint_deadline_ns == anchor + PERIOD_120HZ / 4);
+
+    auto late = scheduler.schedule_frame(anchor + 5 * MS, -1, true, false);
+    CHECK(late.delay_ns > 0);
+    CHECK(late.delay_ns < PERIOD_120HZ / 4);
+}
+
+TEST_CASE("Dynamic repaint backs off delayed frames after missed vblanks")
+{
+    wf::adaptive_repaint_scheduler_t scheduler;
+    scheduler.handle_presentation(present(1, 100 * MS, PERIOD_120HZ));
+    auto first = scheduler.schedule_frame(100 * MS, -1, true, false);
+    scheduler.submit_frame(first, wf::repaint_path_t::COMPOSED,
+        100 * MS, 102 * MS, 2, false);
+    int64_t presented_at = first.target_presentation_ns.value();
+    scheduler.handle_presentation(present(2, presented_at, PERIOD_120HZ));
+
+    for (uint32_t seq = 3; seq <= 4; seq++)
+    {
+        auto frame = scheduler.schedule_frame(presented_at, -1, true, false);
+        const int64_t target = frame.target_presentation_ns.value();
+        CHECK(frame.delay_ns > 0);
+        const int64_t started = presented_at + frame.delay_ns;
+        scheduler.submit_frame(frame, wf::repaint_path_t::COMPOSED,
+            started, started + 500'000, seq, false);
+        if (seq == 3)
+        {
+            // Even a GPU completion after the target should shorten future delay.
+            scheduler.observe_render_completion(seq, wf::repaint_path_t::COMPOSED,
+                target - started + 100'000);
+        }
+
+        presented_at = target + PERIOD_120HZ;
+        scheduler.handle_presentation(present(seq, presented_at, PERIOD_120HZ));
+        CHECK(scheduler.get_debug_info(-1).dynamic_delay_penalty_ns ==
+            (seq == 3 ? (PERIOD_120HZ / 4 + 1) / 2 : PERIOD_120HZ / 4));
+    }
+
+    CHECK(scheduler.schedule_frame(presented_at, -1, true, false).delay_ns == 0);
+    for (uint32_t seq = 5; seq <= 24; seq++)
+    {
+        auto frame = scheduler.schedule_frame(presented_at, -1, true, false);
+        scheduler.submit_frame(frame, wf::repaint_path_t::COMPOSED,
+            presented_at, presented_at + 500'000, seq, false);
+        presented_at = frame.target_presentation_ns.value();
+        scheduler.handle_presentation(present(seq, presented_at, PERIOD_120HZ));
+    }
+
+    CHECK(scheduler.get_debug_info(-1).dynamic_delay_penalty_ns > 0);
+    CHECK(scheduler.get_debug_info(-1).dynamic_delay_penalty_ns < PERIOD_120HZ / 4);
+    CHECK(scheduler.schedule_frame(presented_at, -1, true, false).delay_ns > 0);
+    scheduler.reset(true);
+    CHECK(scheduler.get_debug_info(-1).dynamic_delay_penalty_ns == 0);
+}
+
+TEST_CASE("Fixed repaint budgets do not accumulate a dynamic delay penalty")
+{
+    wf::adaptive_repaint_scheduler_t scheduler;
+    scheduler.handle_presentation(present(1, 100 * MS, PERIOD_120HZ));
+    auto frame = scheduler.schedule_frame(100 * MS, 2, false, false);
+    CHECK(frame.delay_ns > 0);
+    scheduler.submit_frame(frame, wf::repaint_path_t::COMPOSED,
+        106 * MS, 107 * MS, 2, false);
+    scheduler.handle_presentation(present(2,
+        frame.target_presentation_ns.value() + PERIOD_120HZ, PERIOD_120HZ));
+    CHECK(scheduler.get_debug_info(2).dynamic_delay_penalty_ns == 0);
 }
 
 TEST_CASE("Repaint scheduler correlates misses by commit sequence")
@@ -89,8 +169,7 @@ TEST_CASE("Fixed-refresh scheduling preserves phase across sparse updates")
     auto sparse = scheduler.schedule_frame(now, 0, true, false);
     CHECK(sparse.target_presentation_ns ==
         first.target_presentation_ns.value() + 13 * PERIOD_60HZ);
-    CHECK(delay_ms(sparse) >= 8);
-    CHECK(delay_ms(sparse) <= 9);
+    CHECK(sparse.delay_ns == PERIOD_60HZ / 4);
 }
 
 TEST_CASE("Fixed-refresh scheduling advances past an elapsed nominal slot")

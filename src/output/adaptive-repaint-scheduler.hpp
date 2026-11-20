@@ -27,6 +27,8 @@ struct repaint_schedule_t
     int64_t presentation_anchor_age_ns = 0;
     /** Whether a small future hardware timestamp was clamped to age zero. */
     bool presentation_anchor_clamped = false;
+    /** Whether this frame used the adaptive delay mode. */
+    bool dynamic_delay_requested = false;
 };
 
 struct repaint_presentation_t
@@ -55,6 +57,8 @@ struct repaint_scheduler_debug_info_t
     uint32_t pending_frames = 0;
     /** Number of consecutive direct-scanout presentations. */
     uint32_t consecutive_scanouts = 0;
+    /** Delay withheld after missed fixed-refresh presentations, in nanoseconds. */
+    int64_t dynamic_delay_penalty_ns = 0;
     /** Path whose budget would be used for the next repaint. */
     repaint_path_t predicted_path = repaint_path_t::COMPOSED;
     render_path_debug_info_t composed;
@@ -126,6 +130,7 @@ class adaptive_repaint_scheduler_t
         int64_t paint_started_ns;
         int64_t refresh_ns;
         bool vrr_enabled;
+        bool dynamic_delay_applied;
     };
 
     estimator_t& get_estimator(repaint_path_t path);
@@ -144,5 +149,6 @@ class adaptive_repaint_scheduler_t
     std::deque<pending_frame_t> pending_frames;
     repaint_path_t last_path = repaint_path_t::COMPOSED;
     uint32_t consecutive_scanouts = 0;
+    int64_t dynamic_delay_penalty_ns = 0;
 };
 }
