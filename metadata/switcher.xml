@@ -31,5 +31,12 @@
 			<_long>Sets the thumbnail rotation in degrees.</_long>
 			<default>30</default>
 		</option>
+		<option name="view_thumbnail_opacity" type="double">
+			<_short>Thumbnail opacity</_short>
+			<_long>Multiplies thumbnail opacity while the switcher is open.</_long>
+			<default>1.0</default>
+			<min>0.0</min>
+			<max>1.0</max>
+		</option>
 	</plugin>
 </wayfire>

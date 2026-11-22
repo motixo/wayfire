@@ -8,11 +8,12 @@ A fork of [Wayfire](https://github.com/WayfireWM/wayfire) with built-in plugins 
 - **Floating windows:** `window-sizes` remembers resized windows and opens them at their saved size, centered in the work area.
 - **Tiling and workspaces:** Simple Tile can use a Dwindle layout and swap tiles by dragging their title bars. Optional workspace clipping keeps windows inside their own workspace. `tile-focus` brings tiles into focus as the pointer enters them and uses a fade when they open.
 - **Dock previews:** `dock-snapshot` captures live and minimized window previews for a dock over Wayfire IPC.
+- **Alt+Tab:** The center preview stays opaque and side previews are dimmed by default. App icons fade as previews appear and disappear.
 - **Rendering:** The fork adjusts adaptive repaint timing, adds a presented-frame counter to `wayfire/render-metrics`, and changes how blur, workspace transitions, and window maximization are rendered.
 
 ## Build and configure
 
-Install the [upstream build dependencies](https://github.com/WayfireWM/wayfire#dependencies) and `json-c`. Install `librsvg` for SVG button icons. Rounded corners and dock previews use GLES. Dock previews also require image I/O support in the build.
+Install the [upstream build dependencies](https://github.com/WayfireWM/wayfire#dependencies) and `json-c`. Optional dependencies include `librsvg` for SVG title bar icons and GTK 3 and GIO development libraries for Alt+Tab app icons. Rounded corners and dock previews use GLES. Dock previews also require image I/O support in the build.
 
 ```sh
 git submodule update --init subprojects/wf-config subprojects/wf-json subprojects/wf-touch subprojects/wf-utils

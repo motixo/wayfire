@@ -27,11 +27,115 @@
 #include <glm/gtc/matrix_transform.hpp>
 
 #include <algorithm>
+#include <map>
 #include <set>
+
+#ifdef WF_SWITCHER_ICONS
+#include <gio/gdesktopappinfo.h>
+#include <gtk/gtk.h>
+#include <wayfire/plugins/common/cairo-util.hpp>
+#endif
 
 constexpr const char *switcher_transformer = "switcher-3d";
 constexpr const char *switcher_transformer_background = "switcher-3d";
 constexpr float background_dim_factor = 0.6;
+
+#ifdef WF_SWITCHER_ICONS
+static GDesktopAppInfo *find_switcher_app(const std::string& app_id)
+{
+    if (app_id.empty())
+    {
+        return nullptr;
+    }
+
+    const auto desktop_id = g_str_has_suffix(app_id.c_str(), ".desktop") ? app_id : app_id + ".desktop";
+    if (auto app = g_desktop_app_info_new(desktop_id.c_str()))
+    {
+        return app;
+    }
+
+    // XWayland applications may report StartupWMClass in place of a desktop ID.
+    auto apps = g_app_info_get_all();
+    GDesktopAppInfo *result = nullptr;
+    for (auto entry = apps; entry; entry = entry->next)
+    {
+        auto info = G_APP_INFO(entry->data);
+        if (!G_IS_DESKTOP_APP_INFO(info))
+        {
+            continue;
+        }
+
+        auto app = G_DESKTOP_APP_INFO(info);
+        const auto *id = g_app_info_get_id(info);
+        const auto *wm_class = g_desktop_app_info_get_startup_wm_class(app);
+        if ((id && g_ascii_strcasecmp(id, desktop_id.c_str()) == 0) ||
+            (wm_class && g_ascii_strcasecmp(wm_class, app_id.c_str()) == 0))
+        {
+            result = G_DESKTOP_APP_INFO(g_object_ref(app));
+            break;
+        }
+    }
+
+    g_list_free_full(apps, g_object_unref);
+    return result;
+}
+
+static GtkIconTheme *create_switcher_icon_theme()
+{
+    auto theme = gtk_icon_theme_new();
+    auto settings = g_key_file_new();
+    auto path = std::string(g_get_user_config_dir()) + "/gtk-3.0/settings.ini";
+    g_key_file_load_from_file(settings, path.c_str(), G_KEY_FILE_NONE, nullptr);
+    auto name = g_key_file_get_string(settings, "Settings", "gtk-icon-theme-name", nullptr);
+    gtk_icon_theme_set_custom_theme(theme, name && *name ? name : "Adwaita");
+    g_free(name);
+    g_key_file_unref(settings);
+    return theme;
+}
+
+static std::shared_ptr<wf::texture_t> load_switcher_icon(GtkIconTheme *theme, const std::string& app_id)
+{
+    constexpr int size = 64;
+    GdkPixbuf *pixbuf = nullptr;
+    auto app = find_switcher_app(app_id);
+    if (app)
+    {
+        if (auto icon = g_app_info_get_icon(G_APP_INFO(app)))
+        {
+            if (auto info = gtk_icon_theme_lookup_by_gicon(theme, icon, size, GTK_ICON_LOOKUP_FORCE_SIZE))
+            {
+                pixbuf = gtk_icon_info_load_icon(info, nullptr);
+                g_object_unref(info);
+            }
+        }
+
+        g_object_unref(app);
+    }
+
+    if (!pixbuf)
+    {
+        pixbuf = gtk_icon_theme_load_icon(theme, "application-x-executable", size,
+            GTK_ICON_LOOKUP_FORCE_SIZE, nullptr);
+    }
+
+    if (!pixbuf)
+    {
+        return {};
+    }
+
+    auto surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, size, size);
+    auto cr = cairo_create(surface);
+    gdk_cairo_set_source_pixbuf(cr, pixbuf,
+        (size - gdk_pixbuf_get_width(pixbuf)) / 2.0, (size - gdk_pixbuf_get_height(pixbuf)) / 2.0);
+    cairo_paint(cr);
+    cairo_destroy(cr);
+    cairo_surface_flush(surface);
+    auto texture = wf::owned_texture_t{surface}.get_texture();
+    cairo_surface_destroy(surface);
+    g_object_unref(pixbuf);
+    return texture;
+}
+#endif
 
 using namespace wf::animation;
 class SwitcherPaintAttribs
@@ -67,11 +171,19 @@ struct SwitcherView
 {
     wayfire_toplevel_view view;
     SwitcherPaintAttribs attribs;
+#ifdef WF_SWITCHER_ICONS
+    simple_animation_t icon_visibility;
+    wf::geometry_t icon_anchor{};
+    std::shared_ptr<wf::texture_t> icon;
+#endif
 
     int position;
     int64_t expired_timestamp = 0;
 
     SwitcherView(const wf::option_sptr_t<wf::animation_description_t>& duration) : attribs(duration)
+#ifdef WF_SWITCHER_ICONS
+        , icon_visibility(duration)
+#endif
     {}
 
     /* Make animation start values the current progress of duration */
@@ -87,6 +199,13 @@ struct SwitcherView
 
     bool animation_finished()
     {
+#ifdef WF_SWITCHER_ICONS
+        if (icon_visibility.running())
+        {
+            return false;
+        }
+#endif
+
         return attribs.timer.running() == false;
     }
 
@@ -112,6 +231,8 @@ class WayfireSwitcher : public wf::per_output_plugin_instance_t, public wf::keyb
     wf::option_wrapper_t<wf::animation_description_t> speed{"switcher/speed"};
     wf::option_wrapper_t<int> view_thumbnail_rotation{
         "switcher/view_thumbnail_rotation"};
+    wf::option_wrapper_t<double> view_thumbnail_opacity{
+        "switcher/view_thumbnail_opacity"};
 
     duration_t background_dim_duration{speed};
     timed_transition_t background_dim{background_dim_duration};
@@ -120,6 +241,10 @@ class WayfireSwitcher : public wf::per_output_plugin_instance_t, public wf::keyb
 
     /* If a view comes before another in this list, it is on top of it */
     std::vector<SwitcherView> views;
+#ifdef WF_SWITCHER_ICONS
+    std::unique_ptr<GtkIconTheme, decltype(&g_object_unref)> icon_theme{nullptr, g_object_unref};
+    std::map<std::string, std::shared_ptr<wf::texture_t>> app_icons;
+#endif
 
     // the modifiers which were used to activate switcher
     uint32_t activating_modifiers = 0;
@@ -396,6 +521,10 @@ class WayfireSwitcher : public wf::per_output_plugin_instance_t, public wf::keyb
         }
 
         views.clear();
+#ifdef WF_SWITCHER_ICONS
+        app_icons.clear();
+        icon_theme.reset();
+#endif
 
         wf::scene::update(wf::get_core().scene(),
             wf::scene::update_flag::INPUT_STATE);
@@ -455,10 +584,10 @@ class WayfireSwitcher : public wf::per_output_plugin_instance_t, public wf::keyb
         float radians_rotation = -((float)view_thumbnail_rotation * (M_PI / 180.0));
         sv.attribs.rotation.restart_with_end(
             sv.attribs.rotation.end + radians_rotation * dir);
-        sv.attribs.alpha.restart_with_end(
-            view_expired(sv.position) ? 0.3 : 0.7);
-
         sv.position += dir;
+        const float slot_opacity = sv.position == SWITCHER_POSITION_CENTER ? 1.0f :
+            (view_expired(sv.position) ? 0.3f : 0.8f);
+        sv.attribs.alpha.restart_with_end(slot_opacity * view_thumbnail_opacity);
         sv.attribs.timer.start();
         if (view_expired(sv.position))
         {
@@ -513,7 +642,7 @@ class WayfireSwitcher : public wf::per_output_plugin_instance_t, public wf::keyb
         float scale = calculate_scaling_factor(bbox);
         sv.attribs.scale_x.set(1, scale);
         sv.attribs.scale_y.set(1, scale);
-        sv.attribs.alpha.set(get_view_normal_alpha(sv.view), 1.0);
+        sv.attribs.alpha.set(get_view_normal_alpha(sv.view), view_thumbnail_opacity);
         sv.attribs.timer.start();
     }
 
@@ -722,6 +851,20 @@ class WayfireSwitcher : public wf::per_output_plugin_instance_t, public wf::keyb
         SwitcherView sw{speed};
         sw.view     = view;
         sw.position = SWITCHER_POSITION_CENTER;
+#ifdef WF_SWITCHER_ICONS
+        if (!icon_theme)
+        {
+            icon_theme.reset(create_switcher_icon_theme());
+        }
+
+        auto [icon, inserted] = app_icons.try_emplace(view->get_app_id());
+        if (inserted)
+        {
+            icon->second = load_switcher_icon(icon_theme.get(), icon->first);
+        }
+
+        sw.icon = icon->second;
+#endif
 
         return sw;
     }
@@ -739,7 +882,7 @@ class WayfireSwitcher : public wf::per_output_plugin_instance_t, public wf::keyb
         wf::render_pass_t::run(params);
     }
 
-    void render_view(const SwitcherView& sv, const wf::render_target_t& buffer)
+    void render_view(SwitcherView& sv, const wf::render_target_t& buffer)
     {
         auto transform = sv.view->get_transformed_node()
             ->get_transformer<wf::scene::view_3d_transformer_t>(switcher_transformer);
@@ -756,6 +899,10 @@ class WayfireSwitcher : public wf::per_output_plugin_instance_t, public wf::keyb
             (float)sv.attribs.rotation, {0.0, 1.0, 0.0});
 
         transform->color[3] = sv.attribs.alpha;
+#ifdef WF_SWITCHER_ICONS
+        // Two thumbnails can share a window and overwrite its transform.
+        sv.icon_anchor = transform->get_bounding_box();
+#endif
         render_view_scene(sv.view, buffer);
     }
 
@@ -831,10 +978,42 @@ class WayfireSwitcher : public wf::per_output_plugin_instance_t, public wf::keyb
         }
 
         /* Render in the reverse order because we don't use depth testing */
-        for (auto view : calculate_render_order())
+        auto render_order = calculate_render_order();
+        for (auto view : render_order)
         {
             render_view(*view, local_target);
         }
+
+#ifdef WF_SWITCHER_ICONS
+        std::set<int> icon_positions;
+        const float icon_alpha = std::clamp((1.0f - float(background_dim)) /
+            (1.0f - background_dim_factor), 0.0f, 1.0f);
+        for (auto view : wf::reverse(render_order))
+        {
+            const bool visible = !view_expired(view->position) &&
+                icon_positions.insert(view->position).second;
+            if (view->icon_visibility.end != visible)
+            {
+                view->icon_visibility.animate(visible ? 1.0 : 0.0);
+            }
+        }
+
+        for (auto view : render_order)
+        {
+            const float opacity = std::min(icon_alpha, float(view->icon_visibility));
+            if ((opacity > 0) && view->icon)
+            {
+                const auto& bounds = view->icon_anchor;
+                constexpr double icon_size = 32;
+                const wf::geometry_t geometry{
+                    bounds.x + (bounds.width - icon_size) / 2,
+                    bounds.y + bounds.height + 8,
+                    icon_size, icon_size};
+                data.pass->add_texture(view->icon, local_target, geometry,
+                    wf::regionf_t{geometry} & local_target.geometry, opacity);
+            }
+        }
+#endif
 
         for (auto view : get_overlay_views())
         {
@@ -864,6 +1043,13 @@ class WayfireSwitcher : public wf::per_output_plugin_instance_t, public wf::keyb
     {
         cleanup_views([=] (SwitcherView& sv)
         {
+#ifdef WF_SWITCHER_ICONS
+            if (sv.icon_visibility.end > 0)
+            {
+                return false;
+            }
+#endif
+
             return view_expired(sv.position) && sv.animation_finished();
         });
     }
@@ -1015,7 +1201,7 @@ class WayfireSwitcher : public wf::per_output_plugin_instance_t, public wf::keyb
 
         /* directly show it on the target position */
         views.back().to_end();
-        views.back().attribs.alpha.set(0, 1);
+        views.back().attribs.alpha.set(0, views.back().attribs.alpha.end);
         views.back().attribs.timer.start();
     }
 
